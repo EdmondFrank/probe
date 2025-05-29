@@ -1,0 +1,55 @@
+{
+  "name": "@edmondfrank/probe",
+  "version": "${version}",
+  "description": "Cross-platform probe code search tool (meta package)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buger/probe.git"
+  },
+  "keywords": [
+    "probe",
+    "code-search",
+    "search",
+    "ast",
+    "code-analysis",
+    "ai",
+    "llm",
+    "tools"
+  ],
+  "author": "buger",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/buger/probe/issues"
+  },
+  "homepage": "https://github.com/buger/probe#readme",
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "bin": {
+    "probe": "bin/probe"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "optionalDependencies": {
+    "@edmondfrank/probe-linux-x64": "^${version}",
+    "@edmondfrank/probe-linux-arm64": "^${version}",
+    "@edmondfrank/probe-darwin-x64": "^${version}",
+    "@edmondfrank/probe-darwin-arm64": "^${version}",
+    "@edmondfrank/probe-win32-x64": "^${version}"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

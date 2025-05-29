@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*" # Trigger on tags like v1.0.0, v1.1.0, etc.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.2.3)"
+        required: false
+        type: string
 
 permissions:
   contents: write # Required to upload release assets
@@ -114,7 +120,12 @@ jobs:
         shell: bash
         run: |
           BINARY_NAME="probe"
-          VERSION="${GITHUB_REF#refs/tags/}" # Extracts tag like v1.0.0
+          # Determine version from tag or workflow_dispatch input
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
           ARCHIVE_NAME="$BINARY_NAME-${VERSION}-${{ matrix.target }}"
           mkdir -p "$ARCHIVE_NAME"
 
@@ -144,182 +155,131 @@ jobs:
           echo "CHECKSUM=$ARCHIVE_NAME.${{ matrix.archive_ext }}.sha256" >> $GITHUB_ENV
 
       # Upload the binary as a release asset
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ env.ASSET }}
-            ${{ env.CHECKSUM }}
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Release
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: |
+      #       ${{ env.ASSET }}
+      #       ${{ env.CHECKSUM }}
+      #     generate_release_notes: true
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GIT_TOKEN }}
 
-  publish-mcp-agent:
-    name: Publish MCP Agent to npm
-    needs: publish-npm-package
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      # --- NPM Package Preparation and Publish ---
 
-      - name: Extract version from tag
-        id: extract_version
-        run: |
-          # Remove 'v' prefix from tag (e.g., v1.0.0 -> 1.0.0)
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION"
-
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
-          registry-url: "https://registry.npmjs.org/"
-          scope: "@buger"
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org/'
+          scope: "@edmondfrank"
           token: ${{ secrets.NPM_TOKEN }} # Let setup-node handle authentication
 
-      - name: Install dependencies
-        run: cd mcp-agent && npm install
-
-      - name: Update package version and dependencies
+      - name: Prepare npm package directory
+        shell: bash
         run: |
-          cd mcp-agent
-          # Update version in package.json without git operations
-          npm version $VERSION --no-git-tag-version
-          # Update dependency on @buger/probe to use the specific version
-          npm pkg set dependencies."@buger/probe"="^$VERSION"
-          echo "Updated MCP Agent package.json to version $VERSION with @buger/probe dependency set to ^$VERSION"
+          PKG_DIR="npm-release/${{ matrix.target }}"
+          mkdir -p "$PKG_DIR"
+          # Extract the binary from the archive into the package root as probe or probe.exe
+          ARCHIVE="${{ env.ASSET }}"
+          BIN_NAME="probe${{ matrix.binary_ext }}"
+          if [[ "${{ matrix.archive_ext }}" == "tar.gz" ]]; then
+            # List archive contents for debugging
+            tar -tzf "$ARCHIVE"
+            # Extract the binary (no wildcards, use direct path)
+            tar -xzf "$ARCHIVE" -C "$PKG_DIR" --strip-components=1 "$(tar -tzf "$ARCHIVE" | grep "/$BIN_NAME$")"
+          elif [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            unzip -j "$ARCHIVE" "$(unzip -Z1 "$ARCHIVE" | grep "/$BIN_NAME$")" -d "$PKG_DIR"
+          fi
+          cp "${{ env.CHECKSUM }}" "$PKG_DIR/" || true
+          cp README.md "$PKG_DIR/" || true
+          cp LICENSE "$PKG_DIR/" || true
+          cp ABOUT.MD "$PKG_DIR/" || true
 
-      - name: Build
-        run: cd mcp-agent && npm run build
+      - name: Generate package.json from template
+        shell: bash
+        run: |
+          PKG_DIR="npm-release/${{ matrix.target }}"
+          # Determine version from tag or workflow_dispatch input
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          # Map Rust target triples to npm os/cpu
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              NODE_OS="linux"
+              NODE_CPU="x64"
+              ;;
+            aarch64-unknown-linux-gnu)
+              NODE_OS="linux"
+              NODE_CPU="arm64"
+              ;;
+            x86_64-apple-darwin)
+              NODE_OS="darwin"
+              NODE_CPU="x64"
+              ;;
+            aarch64-apple-darwin)
+              NODE_OS="darwin"
+              NODE_CPU="arm64"
+              ;;
+            x86_64-pc-windows-msvc)
+              NODE_OS="win32"
+              NODE_CPU="x64"
+              ;;
+            *)
+              echo "Unknown target: ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
+          # Use envsubst to fill in the template
+          export node_pkg="@edmondfrank/probe-${NODE_OS}-${NODE_CPU}"
+          export version="${VERSION#v}"
+          export node_os="${NODE_OS}"
+          export node_arch="${NODE_CPU}"
+          envsubst < npm-release/package.json.tmpl > "$PKG_DIR/package.json"
 
       - name: Publish to npm
-        run: cd mcp-agent && npm publish --access public
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          PKG_DIR="npm-release/${{ matrix.target }}"
+          cd "$PKG_DIR"
+          npm publish --access public
 
-  publish-mcp:
-    name: Publish MCP to npm
-    needs: publish-npm-package
+  publish-meta-package:
+    name: Publish Meta NPM Package
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: extract_version
-        run: |
-          # Remove 'v' prefix from tag (e.g., v1.0.0 -> 1.0.0)
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "18"
-          registry-url: "https://registry.npmjs.org/"
-          scope: "@buger"
-          token: ${{ secrets.NPM_TOKEN }} # Let setup-node handle authentication
-
-      - name: Install dependencies
-        run: cd mcp && npm install
-
-      - name: Update package version and dependencies
-        run: |
-          cd mcp
-          # Update version in package.json without git operations
-          npm version $VERSION --no-git-tag-version
-          # Update dependency on @buger/probe to use the specific version
-          npm pkg set dependencies."@buger/probe"="^$VERSION"
-          echo "Updated MCP package.json to version $VERSION with @buger/probe dependency set to ^$VERSION"
-
-      - name: Build
-        run: cd mcp && npm run build
-
-      - name: Publish to npm
-        run: cd mcp && npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  publish-npm-package:
-    name: Publish Node.js Package to npm
     needs: build-and-release
-    runs-on: ubuntu-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Extract version from tag
-        id: extract_version
-        run: |
-          # Remove 'v' prefix from tag (e.g., v1.0.0 -> 1.0.0)
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION"
-
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
-          registry-url: "https://registry.npmjs.org/"
-          scope: "@buger"
-          token: ${{ secrets.NPM_TOKEN }}
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org/'
+          scope: "@edmondfrank"
+          token: ${{ secrets.NPM_TOKEN }} # Let setup-node handle authentication
 
-      - name: Install dependencies
-        run: cd npm && npm install
-
-      - name: Update package version
+      - name: Generate meta-package package.json
         run: |
-          cd npm
-          # Update version in package.json without git operations
-          npm version $VERSION --no-git-tag-version
-          echo "Updated npm package.json to version $VERSION"
+          VERSION="${GITHUB_REF#refs/tags/}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          fi
+          export version="${VERSION#v}"
+          envsubst < package.json > package.json.out
+          mv package.json.out package.json
 
-      - name: Publish to npm
-        run: cd npm && npm publish --access public
+      - name: Publish meta-package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  publish-probe-chat-package:
-    name: Publish Probe Chat Package to npm
-    needs: publish-npm-package
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: extract_version
         run: |
-          # Remove 'v' prefix from tag (e.g., v1.0.0 -> 1.0.0)
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Extracted version: $VERSION"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "18"
-          registry-url: "https://registry.npmjs.org/"
-          scope: "@buger"
-          token: ${{ secrets.NPM_TOKEN }}
-
-      - name: Install dependencies
-        run: cd examples/chat && npm install
-
-      - name: Update package version and dependencies
-        run: |
-          cd examples/chat
-          # Update version in package.json without git operations
-          npm version $VERSION --no-git-tag-version
-          # Update dependency on @buger/probe to use the specific version
-          npm pkg set dependencies."@buger/probe"="^$VERSION"
-          echo "Updated probe-chat package.json to version $VERSION with @buger/probe dependency set to ^$VERSION"
-
-      - name: Publish to npm
-        run: cd examples/chat && npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-# The publish-probe-web-package job has been removed as the web functionality
-# has been merged into the probe-chat package
+          npm publish --access public

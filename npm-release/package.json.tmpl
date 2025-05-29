@@ -1,0 +1,41 @@
+{
+  "name": "${node_pkg}",
+  "version": "${version}",
+  "description": "Probe CLI binary for ${node_os}-${node_arch}",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buger/probe.git"
+  },
+  "keywords": [
+    "probe",
+    "code-search",
+    "search",
+    "ast",
+    "code-analysis",
+    "ai",
+    "llm",
+    "tools"
+  ],
+  "author": "buger",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/buger/probe/issues"
+  },
+  "homepage": "https://github.com/buger/probe#readme",
+  "os": [
+    "${node_os}"
+  ],
+  "cpu": [
+    "${node_arch}"
+  ],
+  "bin": {
+    "probe": "probe${bin_ext}"
+  },
+  "files": [
+    "probe${bin_ext}"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
