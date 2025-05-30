@@ -54,6 +54,10 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
+      # Install Zig for cross-compilation
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
       # Setup Rust cache
       - name: Setup Rust cache
         uses: actions/cache@v4
@@ -71,6 +75,10 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-
             ${{ runner.os }}-cargo-
 
+      - name: Setup cargo-zigbuild
+        run: |
+          cargo install --locked cargo-zigbuild
+
       - name: Configure APT sources for arm64
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -83,30 +91,59 @@ jobs:
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
           EOF'
 
-      - name: Setup cross-compilation
+      - name: Setup cross-compilation for aarch64-unknown-linux-gnu
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config libssl-dev:arm64 libc6-dev-arm64-cross
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config libssl-dev:arm64 libc6-dev-arm64-cross openssl
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
           echo "OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
           echo "OPENSSL_INCLUDE_DIR=/usr/include" >> $GITHUB_ENV
 
+      - name: Setup cross-compilation for x86_64-unknown-linux-gnu
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev openssl
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=/usr/include" >> $GITHUB_ENV
+          # Symlink missing OpenSSL headers for Ubuntu 22+
+          if [ ! -e /usr/include/openssl/opensslconf.h ] && [ -e /usr/include/x86_64-linux-gnu/openssl/opensslconf.h ]; then
+            sudo ln -s /usr/include/x86_64-linux-gnu/openssl/opensslconf.h /usr/include/openssl/opensslconf.h
+          fi
+          if [ ! -e /usr/include/openssl/configuration.h ] && [ -e /usr/include/x86_64-linux-gnu/openssl/configuration.h ]; then
+            sudo ln -s /usr/include/x86_64-linux-gnu/openssl/configuration.h /usr/include/openssl/configuration.h
+          fi
       # Build the Rust project
       - name: Build Release
         shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export OPENSSL_DIR="/usr/lib/aarch64-linux-gnu"
+            export OPENSSL_LIB_DIR="/usr/lib/aarch64-linux-gnu"
+            export OPENSSL_INCLUDE_DIR="/usr/include"
+            export PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig"
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo zigbuild --release --target ${{ matrix.target }}
+          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            export OPENSSL_DIR="/usr/lib/x86_64-linux-gnu"
+            export OPENSSL_LIB_DIR="/usr/lib/x86_64-linux-gnu"
+            export OPENSSL_INCLUDE_DIR="/usr/include"
+            export PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig"
+            cargo zigbuild --release --target ${{ matrix.target }}
+          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
             # For Windows, use static linking of the C++ runtime
             mkdir -p .cargo
             echo '[target.x86_64-pc-windows-msvc]' > .cargo/config.toml
             echo 'rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/DEBUG:NONE", "-C", "link-args=/NOLOGO"]' >> .cargo/config.toml
-            cargo build --release --target ${{ matrix.target }}
+            cargo zigbuild --release --target ${{ matrix.target }}
           else
             # For other platforms, use the default build
-            cargo build --release --target ${{ matrix.target }}
+            cargo zigbuild --release --target ${{ matrix.target }}
           fi
 
       # Install zip on Windows
