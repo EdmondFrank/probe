@@ -1,0 +1,69 @@
+name: Rust Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Setup Rust cache
+        uses: actions/cache@v4
+        timeout-minutes: 5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain', 'rust-toolchain.toml') || 'stable' }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Show Rust version
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run integration tests
+        run: cargo test --test integration_tests
+
+      - name: Run property tests
+        run: cargo test --test property_tests
+
+      - name: Run CLI tests
+        run: cargo test --test cli_tests

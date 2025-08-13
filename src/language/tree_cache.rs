@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use tree_sitter::Tree;
+
+// PHASE 4 OPTIMIZATION: Use environment variable or CPU count for cache size
+const DEFAULT_CACHE_SIZE: usize = 2000;
 
 lazy_static::lazy_static! {
     /// A cache for parsed syntax trees to avoid redundant parsing
@@ -11,7 +13,14 @@ lazy_static::lazy_static! {
     /// This cache stores parsed ASTs keyed by file path and content hash.
     /// When the same file is parsed multiple times, this avoids the overhead
     /// of re-parsing unchanged files.
-    static ref TREE_CACHE: Mutex<HashMap<String, (Tree, u64)>> = Mutex::new(HashMap::new());
+    /// PHASE 4 OPTIMIZATION: Use LRU cache with bounded size to prevent memory bloat
+    static ref TREE_CACHE: Mutex<LruCache<String, (Tree, u64)>> = {
+        let cache_size = std::env::var("PROBE_TREE_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_SIZE);
+        Mutex::new(LruCache::new(NonZeroUsize::new(cache_size).unwrap()))
+    };
 
     /// A counter for cache hits, used for testing
     static ref CACHE_HITS: Mutex<usize> = Mutex::new(0);
@@ -20,11 +29,22 @@ lazy_static::lazy_static! {
     static ref TEST_MUTEX: Mutex<()> = Mutex::new(());
 }
 
-/// Compute a hash of the content for cache validation
+/// Compute a deterministic hash of the content for cache validation
+///
+/// This uses the same FNV-1a algorithm as the line map cache to ensure
+/// consistent tree cache behavior across program runs.
 fn compute_content_hash(content: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+    // FNV-1a hash algorithm - fast and deterministic
+    // Constants for 64-bit FNV-1a (same as parser.rs)
+    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in content.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Get a cached tree if available, otherwise parse and cache the result
@@ -57,7 +77,8 @@ pub fn get_or_parse_tree(
         let mut cache = TREE_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_tree, cached_hash)) = cache.get(file_path) {
+        // PHASE 4 OPTIMIZATION: Use peek to check without updating LRU order first
+        if let Some((_cached_tree, cached_hash)) = cache.peek(file_path) {
             if cached_hash == &content_hash {
                 // Increment cache hit counter
                 {
@@ -68,39 +89,130 @@ pub fn get_or_parse_tree(
                 }
 
                 if debug_mode {
-                    println!("[DEBUG] Cache hit for file: {}", file_path);
+                    println!("[DEBUG] Cache hit for file: {file_path}");
                 }
+                // PHASE 4 OPTIMIZATION: Now update LRU order with get
+                let (cached_tree, _) = cache.get(file_path).unwrap();
                 return Ok(cached_tree.clone());
             } else {
                 // Content changed, explicitly remove the old entry
-                cache.remove(file_path);
+                // PHASE 4 OPTIMIZATION: LRU cache uses pop instead of remove
+                cache.pop(file_path);
                 if debug_mode {
-                    println!(
-                        "[DEBUG] Cache invalidated for file: {} (content changed)",
-                        file_path
-                    );
+                    println!("[DEBUG] Cache invalidated for file: {file_path} (content changed)");
                 }
             }
         } else if debug_mode {
-            println!("[DEBUG] Cache miss for file: {}", file_path);
+            println!("[DEBUG] Cache miss for file: {file_path}");
         }
     }
 
     // Not in cache or content changed, parse and store
     let tree = parser
         .parse(content, None)
-        .context(format!("Failed to parse file: {}", file_path))?;
+        .context(format!("Failed to parse file: {file_path}"))?;
 
     // Store in cache
     {
         let mut cache = TREE_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert(file_path.to_string(), (tree.clone(), content_hash));
+        // PHASE 4 OPTIMIZATION: LRU cache automatically evicts old entries
+        cache.put(file_path.to_string(), (tree.clone(), content_hash));
 
         if debug_mode {
-            println!("[DEBUG] Cached parsed tree for file: {}", file_path);
+            println!("[DEBUG] Cached parsed tree for file: {file_path}");
             println!("[DEBUG] Current cache size: {} entries", cache.len());
+        }
+    }
+
+    Ok(tree)
+}
+
+/// Get a cached tree if available, otherwise parse using a pooled parser and cache the result
+///
+/// This is an optimized version of `get_or_parse_tree` that uses the parser pool to avoid
+/// the expensive overhead of creating and configuring parsers for each file. This function
+/// automatically manages parser acquisition and return, providing significant performance
+/// improvements for batch processing operations.
+///
+/// # Arguments
+///
+/// * `file_path` - The path of the file being parsed (used for cache key)
+/// * `content` - The content to parse
+/// * `extension` - The file extension to determine the language and parser type
+///
+/// # Returns
+///
+/// A Result containing the parsed tree, either from cache or freshly parsed using a pooled parser
+pub fn get_or_parse_tree_pooled(file_path: &str, content: &str, extension: &str) -> Result<Tree> {
+    use crate::language::parser_pool::{get_pooled_parser, return_pooled_parser};
+
+    let content_hash = compute_content_hash(content);
+
+    // Check if debug mode is enabled
+    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+
+    // Try to get from cache first
+    {
+        let mut cache = TREE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // PHASE 4 OPTIMIZATION: Use peek to check without updating LRU order first
+        if let Some((_cached_tree, cached_hash)) = cache.peek(file_path) {
+            if cached_hash == &content_hash {
+                // Increment cache hit counter
+                {
+                    let mut hits = CACHE_HITS
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *hits += 1;
+                }
+
+                if debug_mode {
+                    println!("[DEBUG] Tree cache hit for file: {file_path}");
+                }
+                // PHASE 4 OPTIMIZATION: Now update LRU order with get
+                let (cached_tree, _) = cache.get(file_path).unwrap();
+                return Ok(cached_tree.clone());
+            } else {
+                // Content changed, explicitly remove the old entry
+                // PHASE 4 OPTIMIZATION: LRU cache uses pop instead of remove
+                cache.pop(file_path);
+                if debug_mode {
+                    println!(
+                        "[DEBUG] Tree cache invalidated for file: {file_path} (content changed)"
+                    );
+                }
+            }
+        } else if debug_mode {
+            println!("[DEBUG] Tree cache miss for file: {file_path}");
+        }
+    }
+
+    // Not in cache or content changed, get a pooled parser and parse
+    let mut parser = get_pooled_parser(extension).context(format!(
+        "Failed to get pooled parser for extension: {extension}"
+    ))?;
+
+    let tree = parser
+        .parse(content, None)
+        .context(format!("Failed to parse file: {file_path}"))?;
+
+    // Return parser to pool
+    return_pooled_parser(extension, parser);
+
+    // Store in cache
+    {
+        let mut cache = TREE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // PHASE 4 OPTIMIZATION: LRU cache automatically evicts old entries
+        cache.put(file_path.to_string(), (tree.clone(), content_hash));
+
+        if debug_mode {
+            println!("[DEBUG] Cached parsed tree for file: {file_path}");
+            println!("[DEBUG] Current tree cache size: {} entries", cache.len());
         }
     }
 
@@ -142,8 +254,8 @@ pub fn invalidate_cache_entry(file_path: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
-    if cache.remove(file_path).is_some() && debug_mode {
-        println!("[DEBUG] Removed file from cache: {}", file_path);
+    if cache.pop(file_path).is_some() && debug_mode {
+        println!("[DEBUG] Removed file from cache: {file_path}");
     }
 }
 
@@ -173,7 +285,7 @@ pub fn is_in_cache(file_path: &str) -> bool {
     let cache = TREE_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.contains_key(file_path)
+    cache.contains(file_path)
 }
 
 /// Reset the cache hit counter (for testing)

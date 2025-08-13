@@ -1,6 +1,8 @@
-use crate::search::elastic_query::Expr;
-use crate::search::tokenization;
+use crate::simd_ranking::{SimdBm25Params, SparseDocumentMatrix};
 use ahash::{AHashMap, AHashSet};
+use probe_code::search::elastic_query::Expr;
+use probe_code::search::tokenization;
+use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 use std::sync::OnceLock;
 
@@ -41,6 +43,12 @@ pub fn get_stemmer() -> &'static Stemmer {
 /// removes stop words, and applies stemming. Also splits camelCase/PascalCase identifiers.
 pub fn tokenize(text: &str) -> Vec<String> {
     tokenization::tokenize(text)
+}
+
+/// Preprocesses text for search by tokenizing and removing duplicates
+/// This is a lighter version that doesn't include filename tokens
+pub fn preprocess_text(text: &str) -> Vec<String> {
+    tokenize(text)
 }
 
 /// Preprocesses text with filename for search by tokenizing and removing duplicates
@@ -112,7 +120,10 @@ pub fn precompute_idfs(
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
-        println!("DEBUG: Precomputing IDF values for {} terms", terms.len());
+        println!(
+            "DEBUG: Precomputing IDF values for {terms_len} terms",
+            terms_len = terms.len()
+        );
     }
 
     terms
@@ -123,11 +134,12 @@ pub fn precompute_idfs(
                 let numerator = (n_docs as f64 - df as f64) + 0.5;
                 let denominator = df as f64 + 0.5;
                 let idf = (1.0 + (numerator / denominator)).ln();
-                Some((term.clone(), idf))
+                Some((term.as_str(), idf))
             } else {
                 None
             }
         })
+        .map(|(term, idf)| (term.to_string(), idf))
         .collect()
 }
 
@@ -157,12 +169,12 @@ fn generate_query_token_map(query_terms: &HashSet<String>) -> Result<QueryTokenM
     let mut index: u8 = 0;
 
     // Sort terms for deterministic mapping (HashMap iteration order isn't guaranteed)
-    let mut sorted_terms: Vec<&String> = query_terms.iter().collect();
+    let mut sorted_terms: Vec<&str> = query_terms.iter().map(|s| s.as_str()).collect();
     sorted_terms.sort();
 
     // Assign each term a unique index
     for term in sorted_terms {
-        token_map.insert(term.clone(), index);
+        token_map.insert(term.to_string(), index);
         index = index.wrapping_add(1); // Use wrapping_add to handle potential overflow safely
     }
 
@@ -265,7 +277,6 @@ pub fn score_expr_bm25_optimized(expr: &Expr, params: &PrecomputedBm25Params) ->
 // This is your main entry point for ranking. It now does "pure BM25 like ES."
 // -------------------------------------------------------------------------
 pub fn rank_documents(params: &RankingParams) -> Vec<(usize, f64)> {
-    use rayon::prelude::*;
     use std::cmp::Ordering;
 
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
@@ -276,14 +287,11 @@ pub fn rank_documents(params: &RankingParams) -> Vec<(usize, f64)> {
         Ok(expr) => expr,
         Err(e) => {
             if debug_mode {
-                eprintln!("DEBUG: parse_query failed: {:?}", e);
+                eprintln!("DEBUG: parse_query failed: {e:?}");
             }
             // Instead of silently returning empty results, log a warning even in non-debug mode
             // to ensure errors are visible and can be addressed
-            eprintln!(
-                "WARNING: Query parsing failed: {:?}. Returning empty results.",
-                e
-            );
+            eprintln!("WARNING: Query parsing failed: {e:?}. Returning empty results.");
             // In a future version, consider changing the return type to Result<Vec<(usize, f64)>, QueryError>
             // to properly propagate errors to the caller
             return vec![];
@@ -298,9 +306,9 @@ pub fn rank_documents(params: &RankingParams) -> Vec<(usize, f64)> {
         Ok(map) => map,
         Err(e) => {
             if debug_mode {
-                eprintln!("DEBUG: Failed to generate query token map: {}", e);
+                eprintln!("DEBUG: Failed to generate query token map: {e}");
             }
-            eprintln!("WARNING: {}", e);
+            eprintln!("WARNING: {e}");
             return vec![];
         }
     };
@@ -350,14 +358,11 @@ pub fn rank_documents(params: &RankingParams) -> Vec<(usize, f64)> {
     // k1=1.2 controls term frequency saturation (higher values give more weight to term frequency)
     // b=0.75 controls document length normalization (higher values give more penalty to longer documents)
     // See: Robertson, S. E., & Zaragoza, H. (2009). The Probabilistic Relevance Framework: BM25 and Beyond
-    let k1 = 1.2;
-    let b = 0.75;
+    let k1 = 1.5; // EXPERIMENT: Slightly increased from 1.2 for balanced term frequency weight
+    let b = 0.5; // EXPERIMENT: Moderately reduced from 0.75 for balanced length normalization
 
     if debug_mode {
-        println!(
-            "DEBUG: Starting parallel document scoring for {} documents",
-            n_docs
-        );
+        println!("DEBUG: Starting parallel document scoring for {n_docs} documents");
     }
 
     // 5) Compute BM25 bool logic score for each doc in parallel
@@ -422,6 +427,262 @@ pub fn rank_documents(params: &RankingParams) -> Vec<(usize, f64)> {
     filtered_docs
 }
 
+/// SIMD-optimized version of rank_documents using SimSIMD for vector operations
+/// This provides significant performance improvements for large document sets
+pub fn rank_documents_simd(params: &RankingParams) -> Vec<(usize, f64)> {
+    use std::cmp::Ordering;
+
+    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+
+    if debug_mode {
+        println!("DEBUG: Using SIMD-optimized ranking");
+    }
+
+    // 1) Parse the user query into an AST (Expr)
+    let parsed_expr = match crate::search::elastic_query::parse_query(params.query, false) {
+        Ok(expr) => expr,
+        Err(e) => {
+            if debug_mode {
+                eprintln!("DEBUG: parse_query failed: {e:?}");
+            }
+            eprintln!("WARNING: Query parsing failed: {e:?}. Returning empty results.");
+            return vec![];
+        }
+    };
+
+    // 2) Extract query terms, create token mapping
+    let query_terms = extract_query_terms(&parsed_expr);
+
+    // Generate query token map (maps each unique query term to a unique u8 index)
+    let query_token_map = match generate_query_token_map(&query_terms) {
+        Ok(map) => map,
+        Err(e) => {
+            if debug_mode {
+                eprintln!("DEBUG: Failed to generate query token map: {e}");
+            }
+            eprintln!("WARNING: {e}");
+            return vec![];
+        }
+    };
+
+    if debug_mode {
+        println!(
+            "DEBUG: Generated query token map with {} entries for SIMD processing",
+            query_token_map.len()
+        );
+    }
+
+    // 3) Precompute TF/DF for docs
+    let tf_df_result = if let Some(pre_tokenized) = &params.pre_tokenized {
+        if debug_mode {
+            println!("DEBUG: Using pre-tokenized content for SIMD ranking");
+        }
+        compute_tf_df_from_tokenized(pre_tokenized, &query_token_map)
+    } else {
+        if debug_mode {
+            println!("DEBUG: Tokenizing documents for SIMD ranking");
+        }
+        let tokenized_docs: Vec<Vec<String>> =
+            params.documents.iter().map(|doc| tokenize(doc)).collect();
+        compute_tf_df_from_tokenized(&tokenized_docs, &query_token_map)
+    };
+
+    let n_docs = params.documents.len();
+    let avgdl = compute_avgdl(&tf_df_result.document_lengths);
+
+    // 4) Precompute IDF values
+    let precomputed_idfs =
+        precompute_idfs(&query_terms, &tf_df_result.document_frequencies, n_docs);
+
+    if debug_mode {
+        println!(
+            "DEBUG: Precomputed IDF values for {} unique query terms for SIMD processing",
+            precomputed_idfs.len()
+        );
+    }
+
+    // 5) Create sparse document matrix for SIMD operations
+    let sparse_matrix = SparseDocumentMatrix::from_ranking_data(
+        &tf_df_result.term_frequencies,
+        &tf_df_result.document_lengths,
+        &query_terms.iter().cloned().collect::<Vec<_>>(),
+        &query_token_map,
+        &precomputed_idfs,
+        avgdl,
+    );
+
+    if debug_mode {
+        println!(
+            "DEBUG: Created sparse matrix with {} documents for SIMD operations",
+            sparse_matrix.documents.len()
+        );
+    }
+
+    // 6) Create SIMD BM25 parameters
+    let simd_params = SimdBm25Params::new(&sparse_matrix, &tf_df_result.document_lengths);
+
+    // 7) Compute BM25 scores using SIMD operations
+    if debug_mode {
+        println!("DEBUG: Starting SIMD-accelerated BM25 scoring for {n_docs} documents");
+    }
+
+    let scores = simd_params.score_all_documents();
+
+    if debug_mode {
+        println!("DEBUG: SIMD BM25 scoring completed");
+    }
+
+    // 8) Apply boolean query logic efficiently with SIMD scores
+    // Only do traditional computation for documents that have SIMD scores > 0
+    let scored_docs: Vec<(usize, f64)> = scores
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, simd_score)| {
+            if simd_score <= 0.0 {
+                return None; // Skip documents with no matching terms
+            }
+
+            let doc_tf = &tf_df_result.term_frequencies[i];
+            let doc_len = tf_df_result.document_lengths[i];
+
+            // Create traditional BM25 parameters for boolean expression evaluation
+            let precomputed_bm25_params = PrecomputedBm25Params {
+                doc_tf,
+                doc_len,
+                avgdl,
+                idfs: &precomputed_idfs,
+                query_token_map: &query_token_map,
+                k1: 1.5, // EXPERIMENT: Slightly increased from 1.2
+                b: 0.5,  // EXPERIMENT: Moderately reduced from 0.75
+            };
+
+            // Apply boolean query logic - this filters out documents that don't match requirements
+            score_expr_bm25_optimized(&parsed_expr, &precomputed_bm25_params)
+                .map(|expr_score| (i, expr_score))
+        })
+        .collect();
+
+    if debug_mode {
+        println!("DEBUG: SIMD-filtered boolean query evaluation completed");
+    }
+
+    // 9) Sort results by SIMD score in descending order
+    let mut filtered_docs = scored_docs;
+    filtered_docs.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    if debug_mode {
+        println!(
+            "DEBUG: SIMD-optimized ranking completed with {} matching documents",
+            filtered_docs.len()
+        );
+    }
+
+    filtered_docs
+}
+
+/// Simple SIMD-only BM25 ranking for basic queries (no complex boolean logic)
+/// This provides maximum performance for straightforward term-based queries
+pub fn rank_documents_simd_simple(params: &RankingParams) -> Vec<(usize, f64)> {
+    use std::cmp::Ordering;
+
+    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+
+    if debug_mode {
+        println!("DEBUG: Using simple SIMD-only ranking (no boolean logic)");
+    }
+
+    // 1) Simple tokenization of query (treat as individual terms)
+    let query_terms_vec = tokenize(params.query);
+    let query_terms: HashSet<String> = query_terms_vec.into_iter().collect();
+
+    if query_terms.is_empty() {
+        return vec![];
+    }
+
+    // Generate query token map
+    let query_token_map = match generate_query_token_map(&query_terms) {
+        Ok(map) => map,
+        Err(e) => {
+            if debug_mode {
+                eprintln!("DEBUG: Failed to generate query token map: {e}");
+            }
+            return vec![];
+        }
+    };
+
+    // 2) Precompute TF/DF for docs
+    let tf_df_result = if let Some(pre_tokenized) = &params.pre_tokenized {
+        compute_tf_df_from_tokenized(pre_tokenized, &query_token_map)
+    } else {
+        let tokenized_docs: Vec<Vec<String>> =
+            params.documents.iter().map(|doc| tokenize(doc)).collect();
+        compute_tf_df_from_tokenized(&tokenized_docs, &query_token_map)
+    };
+
+    let n_docs = params.documents.len();
+    let avgdl = compute_avgdl(&tf_df_result.document_lengths);
+
+    // 3) Precompute IDF values
+    let precomputed_idfs =
+        precompute_idfs(&query_terms, &tf_df_result.document_frequencies, n_docs);
+
+    // 4) Create sparse document matrix for pure SIMD operations
+    let sparse_matrix = SparseDocumentMatrix::from_ranking_data(
+        &tf_df_result.term_frequencies,
+        &tf_df_result.document_lengths,
+        &query_terms.iter().cloned().collect::<Vec<_>>(),
+        &query_token_map,
+        &precomputed_idfs,
+        avgdl,
+    );
+
+    // 5) Compute pure SIMD BM25 scores
+    let simd_params = SimdBm25Params::new(&sparse_matrix, &tf_df_result.document_lengths);
+    let scores = simd_params.score_all_documents();
+
+    if debug_mode {
+        println!(
+            "DEBUG: Pure SIMD scoring completed for {} documents",
+            scores.len()
+        );
+    }
+
+    // 6) Create results with scores > 0
+    let mut filtered_docs: Vec<(usize, f64)> = scores
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, score)| {
+            if score > 0.0 {
+                Some((i, score as f64))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // 7) Sort by score (descending)
+    filtered_docs.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    if debug_mode {
+        println!(
+            "DEBUG: Simple SIMD ranking completed with {} matching documents",
+            filtered_docs.len()
+        );
+    }
+
+    filtered_docs
+}
+
 /// Computes term frequencies (TF) for each document, document frequencies (DF) for each term,
 /// and document lengths from pre-tokenized content.
 ///
@@ -430,12 +691,10 @@ pub fn compute_tf_df_from_tokenized(
     tokenized_docs: &[Vec<String>],
     query_token_map: &QueryTokenMap,
 ) -> TfDfResult {
-    use rayon::prelude::*;
-
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
-        println!("DEBUG: Starting parallel TF-DF computation from pre-tokenized content for {} documents", tokenized_docs.len());
+        println!("DEBUG: Starting parallel TF-DF computation from pre-tokenized content for {docs_len} documents", docs_len = tokenized_docs.len());
     }
 
     // Process documents in parallel to compute term frequencies and document lengths
@@ -692,8 +951,7 @@ mod tests {
             assert_eq!(
                 Some(&idx1),
                 token_map2.get(term),
-                "Term '{}' has different indices in the two maps",
-                term
+                "Term '{term}' has different indices in the two maps"
             );
         }
     }
@@ -701,7 +959,7 @@ mod tests {
     #[test]
     fn test_generate_query_token_map_too_many_terms() {
         // Create a set with more than 256 terms
-        let query_terms: HashSet<String> = (0..257).map(|i| format!("term{}", i)).collect();
+        let query_terms: HashSet<String> = (0..257).map(|i| format!("term{i}")).collect();
 
         // Attempt to generate the token map
         let result = generate_query_token_map(&query_terms);

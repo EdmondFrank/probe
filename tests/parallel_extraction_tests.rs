@@ -1,4 +1,4 @@
-use probe::extract::{handle_extract, ExtractOptions};
+use probe_code::extract::{handle_extract, ExtractOptions};
 use std::fs;
 use tempfile::tempdir;
 
@@ -13,10 +13,9 @@ fn test_parallel_file_extraction() {
     let mut file_paths = Vec::new();
 
     for i in 0..file_count {
-        let file_path = base_path.join(format!("test_file_{}.rs", i));
+        let file_path = base_path.join(format!("test_file_{i}.rs"));
         let content = format!(
-            "// Test file {}\n\nfn function_a() {{\n    println!(\"Hello from function A\");\n}}\n\nfn function_b() {{\n    println!(\"Hello from function B\");\n}}\n",
-            i
+            "// Test file {i}\n\nfn function_a() {{\n    println!(\"Hello from function A\");\n}}\n\nfn function_b() {{\n    println!(\"Hello from function B\");\n}}\n"
         );
         fs::write(&file_path, content).unwrap();
         file_paths.push(file_path.to_string_lossy().to_string());
@@ -37,6 +36,7 @@ fn test_parallel_file_extraction() {
         instructions: None,
         keep_input: false,
         prompt: None,
+        no_gitignore: false,
     };
 
     // Run the extraction
@@ -80,7 +80,7 @@ fn function_four() {
     let mut file_paths = Vec::new();
 
     for i in 0..file_count {
-        let path = base_path.join(format!("multi_function_{}.rs", i));
+        let path = base_path.join(format!("multi_function_{i}.rs"));
         fs::write(&path, content).unwrap();
         file_paths.push(path.to_string_lossy().to_string());
     }
@@ -99,6 +99,7 @@ fn function_four() {
         instructions: None,
         keep_input: false,
         prompt: None,
+        no_gitignore: false,
     };
 
     // Run the extraction
@@ -128,7 +129,7 @@ fn test_parallel_extraction_performance() {
     let mut file_paths = Vec::new();
 
     for i in 0..file_count {
-        let file_path = base_path.join(format!("perf_test_{}.rs", i));
+        let file_path = base_path.join(format!("perf_test_{i}.rs"));
 
         // Create a file with multiple functions to make parsing non-trivial
         let content = format!(
@@ -136,8 +137,7 @@ fn test_parallel_extraction_performance() {
             i,
             (0..20)
                 .map(|j| format!(
-                "fn function_{}_{}() {{\n    let x = {};\n    println!(\"Value: {{}}\", x);\n}}\n",
-                i, j, j
+                "fn function_{i}_{j}() {{\n    let x = {j};\n    println!(\"Value: {{}}\", x);\n}}\n"
             ))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -166,6 +166,7 @@ fn test_parallel_extraction_performance() {
         instructions: None,
         keep_input: false,
         prompt: None,
+        no_gitignore: false,
     };
 
     // Run the extraction

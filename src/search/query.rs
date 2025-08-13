@@ -1,6 +1,9 @@
-use crate::search::elastic_query;
+use probe_code::search::elastic_query;
 // No term_exceptions import needed
+use lru::LruCache;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Escapes special regex characters in a string
@@ -26,18 +29,48 @@ pub fn regex_escape(s: &str) -> String {
 
 /// A unified plan holding the parsed AST and a mapping of each AST term to an index.
 /// We store a map for quick lookups of term indices.
-#[derive(Debug)]
 pub struct QueryPlan {
     pub ast: elastic_query::Expr,
     pub term_indices: HashMap<String, usize>,
     pub excluded_terms: HashSet<String>,
     pub exact: bool,
+    /// Optimization hint: true if this is a simple single-term query
+    pub is_simple_query: bool,
+    /// Optimization hint: set of required terms that must all be present
+    pub required_terms: HashSet<String>,
+
+    // PHASE 3C OPTIMIZATION: Pre-computed AST metadata
+    /// Pre-computed: whether the AST has any required term anywhere
+    pub has_required_anywhere: bool,
+    /// Pre-computed: indices of required terms for fast lookup
+    pub required_terms_indices: HashSet<usize>,
+    /// Pre-computed: whether AST has only excluded terms
+    pub has_only_excluded_terms: bool,
+    /// Evaluation result cache for matched term patterns
+    pub evaluation_cache: Arc<Mutex<LruCache<u64, bool>>>,
+}
+
+impl std::fmt::Debug for QueryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryPlan")
+            .field("ast", &self.ast)
+            .field("term_indices", &self.term_indices)
+            .field("excluded_terms", &self.excluded_terms)
+            .field("exact", &self.exact)
+            .field("is_simple_query", &self.is_simple_query)
+            .field("required_terms", &self.required_terms)
+            .field("has_required_anywhere", &self.has_required_anywhere)
+            .field("required_terms_indices", &self.required_terms_indices)
+            .field("has_only_excluded_terms", &self.has_only_excluded_terms)
+            .field("evaluation_cache", &"<LruCache>")
+            .finish()
+    }
 }
 
 /// Helper function to format duration in a human-readable way
 fn format_duration(duration: std::time::Duration) -> String {
     if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
+        format!("{millis}ms", millis = duration.as_millis())
     } else {
         format!("{:.2}s", duration.as_secs_f64())
     }
@@ -50,17 +83,14 @@ pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_
     let start_time = Instant::now();
 
     if debug_mode {
-        println!("DEBUG: Starting query plan creation for query: '{}'", query);
+        println!("DEBUG: Starting query plan creation for query: '{query}'");
     }
 
     // Use the regular AST parsing
     let parsing_start = Instant::now();
 
     if debug_mode {
-        println!(
-            "DEBUG: Starting AST parsing for query: '{}', exact={}",
-            query, exact
-        );
+        println!("DEBUG: Starting AST parsing for query: '{query}', exact={exact}");
     }
 
     // Parse the query into an AST with processed terms
@@ -79,7 +109,7 @@ pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_
             "DEBUG: AST parsing completed in {}",
             format_duration(parsing_duration)
         );
-        println!("DEBUG: Parsed AST: {}", ast);
+        println!("DEBUG: Parsed AST: {ast}");
     }
 
     // We'll walk the AST to build a set of all terms. We track excluded as well for reference.
@@ -133,12 +163,67 @@ pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_
         );
     }
 
+    // Collect required terms for optimization
+    let mut required_terms = HashSet::new();
+    collect_required_terms(&ast, &mut required_terms);
+
+    // Determine if this is a simple query for optimization
+    let is_simple_query = match &ast {
+        elastic_query::Expr::Term { excluded, .. } => !excluded && all_terms.len() == 1,
+        _ => false,
+    };
+
+    // PHASE 3C OPTIMIZATION: Pre-compute AST metadata
+    let has_required_anywhere = ast.has_required_term();
+    let has_only_excluded_terms = ast.is_only_excluded_terms();
+
+    // Pre-compute required term indices
+    let required_terms_indices: HashSet<usize> = required_terms
+        .iter()
+        .filter_map(|term| term_indices.get(term).cloned())
+        .collect();
+
+    // Create evaluation cache with reasonable capacity
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
     Ok(QueryPlan {
         ast,
         term_indices,
         excluded_terms,
         exact,
+        is_simple_query,
+        required_terms,
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     })
+}
+
+/// Collect required terms from the AST for optimization
+fn collect_required_terms(expr: &elastic_query::Expr, required_terms: &mut HashSet<String>) {
+    match expr {
+        elastic_query::Expr::Term {
+            keywords,
+            required,
+            excluded,
+            ..
+        } => {
+            if *required && !*excluded {
+                for keyword in keywords {
+                    required_terms.insert(keyword.clone());
+                }
+            }
+        }
+        elastic_query::Expr::And(left, right) => {
+            collect_required_terms(left, required_terms);
+            collect_required_terms(right, required_terms);
+        }
+        elastic_query::Expr::Or(_, _) => {
+            // For OR expressions, we can't guarantee any term is required
+            // so we don't collect anything
+        }
+    }
 }
 
 /// Recursively update the AST to mark all terms as exact
@@ -178,7 +263,7 @@ fn collect_all_terms(
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
-        println!("DEBUG: Collecting terms from expression: {:?}", expr);
+        println!("DEBUG: Collecting terms from expression: {expr:?}");
     }
 
     match expr {
@@ -193,16 +278,13 @@ fn collect_all_terms(
             all_terms.extend(keywords.clone());
 
             if debug_mode {
-                println!(
-                    "DEBUG: Collected keywords '{:?}', excluded={}",
-                    keywords, is_excluded
-                );
+                println!("DEBUG: Collected keywords '{keywords:?}', excluded={is_excluded}");
             }
 
             if *is_excluded {
                 for keyword in keywords {
                     if debug_mode {
-                        println!("DEBUG: Adding '{}' to excluded terms set", keyword);
+                        println!("DEBUG: Adding '{keyword}' to excluded terms set");
                     }
 
                     // Add the keyword to excluded terms
@@ -224,10 +306,7 @@ fn collect_all_terms(
             {
                 for keyword in keywords {
                     if debug_mode {
-                        println!(
-                            "DEBUG: Adding excluded term '{}' from AND expression",
-                            keyword
-                        );
+                        println!("DEBUG: Adding excluded term '{keyword}' from AND expression");
                     }
                     excluded.insert(keyword.clone());
                 }
@@ -246,8 +325,8 @@ fn collect_all_terms(
     }
 
     if debug_mode {
-        println!("DEBUG: Current all_terms: {:?}", all_terms);
-        println!("DEBUG: Current excluded terms: {:?}", excluded);
+        println!("DEBUG: Current all_terms: {all_terms:?}");
+        println!("DEBUG: Current excluded terms: {excluded:?}");
     }
 }
 
@@ -266,7 +345,7 @@ pub fn build_combined_pattern(terms: &[String]) -> String {
     let escaped_terms = terms.iter().map(|t| regex_escape(t)).collect::<Vec<_>>();
 
     // Join terms with | operator and add case-insensitive flag without word boundaries
-    let pattern = format!("(?i)({})", escaped_terms.join("|"));
+    let pattern = format!("(?i)({terms})", terms = escaped_terms.join("|"));
 
     if debug_mode {
         let duration = start_time.elapsed();
@@ -296,17 +375,16 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
 
     if debug_mode {
         println!("DEBUG: Creating structured patterns with AST awareness");
-        println!("DEBUG: AST: {:?}", plan.ast);
-        println!("DEBUG: Excluded terms: {:?}", plan.excluded_terms);
+        println!("DEBUG: AST: {ast:?}", ast = plan.ast);
+        println!(
+            "DEBUG: Excluded terms: {excluded_terms:?}",
+            excluded_terms = plan.excluded_terms
+        );
     }
 
-    // Extract all non-excluded terms from the query plan
-    let terms: Vec<String> = plan
-        .term_indices
-        .keys()
-        .filter(|term| !plan.excluded_terms.contains(*term))
-        .cloned()
-        .collect();
+    // Extract ALL terms from the query plan (including excluded ones)
+    // Excluded terms need to be found during search so they can be properly excluded during evaluation
+    let terms: Vec<String> = plan.term_indices.keys().cloned().collect();
 
     if !terms.is_empty() {
         let combined_pattern = build_combined_pattern(&terms);
@@ -318,14 +396,8 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
             .collect();
 
         if debug_mode {
-            println!(
-                "DEBUG: Created combined pattern for all terms: '{}'",
-                combined_pattern
-            );
-            println!(
-                "DEBUG: Combined pattern includes indices: {:?}",
-                all_indices
-            );
+            println!("DEBUG: Created combined pattern for all terms: '{combined_pattern}'");
+            println!("DEBUG: Combined pattern includes indices: {all_indices:?}");
         }
 
         results.push((combined_pattern, all_indices));
@@ -348,28 +420,21 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                 exact,
                 ..
             } => {
-                // Skip pattern generation for excluded terms
-                if *excluded {
-                    if debug_mode {
-                        println!(
-                            "DEBUG: Skipping pattern generation for excluded term: '{:?}'",
-                            keywords
-                        );
-                    }
-                    return; // Skip pattern generation for excluded terms
+                // FIXED: Don't skip pattern generation for excluded terms
+                // Excluded terms need to be found during search so they can be properly excluded during evaluation
+                if debug_mode && *excluded {
+                    println!(
+                        "DEBUG: Generating patterns for excluded term (will be filtered during evaluation): '{keywords:?}'"
+                    );
                 }
 
                 // Process each keyword
                 for keyword in keywords {
-                    // ADDED: Check against the global exclusion list first
-                    if plan.excluded_terms.contains(keyword) {
-                        if debug_mode {
-                            println!(
-                                    "DEBUG: Skipping pattern generation for globally excluded keyword: '{}'",
-                                    keyword
-                                );
-                        }
-                        continue;
+                    // Note: We still generate patterns for excluded terms so they can be found and then filtered out
+                    if debug_mode && plan.excluded_terms.contains(keyword) {
+                        println!(
+                            "DEBUG: Generating pattern for globally excluded keyword (will be filtered during evaluation): '{keyword}'"
+                        );
                     }
                     // The original check `if *excluded` (line 352) already handles terms explicitly marked with `-`
                     // No need for an additional check here for `*excluded` as the outer check handles it.
@@ -382,14 +447,11 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                         let pattern = if *exact {
                             base_pattern.to_string()
                         } else {
-                            format!("({})", base_pattern)
+                            format!("({base_pattern})")
                         };
 
                         if debug_mode {
-                            println!(
-                                "DEBUG: Created pattern for keyword '{}': '{}'",
-                                keyword, pattern
-                            );
+                            println!("DEBUG: Created pattern for keyword '{keyword}': '{pattern}'");
                         }
 
                         results.push((pattern, HashSet::from([idx])));
@@ -400,25 +462,24 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                             let tokens = crate::search::tokenization::tokenize_and_stem(keyword);
 
                             if debug_mode && tokens.len() > 1 {
-                                println!("DEBUG: Term '{}' tokenized into: {:?}", keyword, tokens);
+                                println!("DEBUG: Term '{keyword}' tokenized into: {tokens:?}");
                             }
 
                             // Generate a pattern for each token with the same term index
                             for token in tokens {
                                 let token_pattern = regex_escape(&token);
-                                let pattern = format!("({})", token_pattern);
+                                let pattern = format!("({token_pattern})");
 
                                 if debug_mode {
                                     println!(
-                                            "DEBUG: Created pattern for token '{}' from term '{}': '{}'",
-                                            token, keyword, pattern
+                                            "DEBUG: Created pattern for token '{token}' from term '{keyword}': '{pattern}'"
                                         );
                                 }
 
                                 results.push((pattern, HashSet::from([idx])));
                             }
                         } else if debug_mode {
-                            println!("DEBUG: Skipping tokenization for exact term '{}'", keyword);
+                            println!("DEBUG: Skipping tokenization for exact term '{keyword}'");
                         }
                     }
                 }
@@ -466,8 +527,8 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                     }
 
                     if debug_mode {
-                        println!("DEBUG: Created combined OR pattern: '{}'", combined);
-                        println!("DEBUG: Combined indices: {:?}", indices);
+                        println!("DEBUG: Created combined OR pattern: '{combined}'");
+                        println!("DEBUG: Combined indices: {indices:?}");
                     }
 
                     results.push((combined, indices));
@@ -506,10 +567,7 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
         // Check if the original keyword itself is excluded before processing for compound parts
         if plan.excluded_terms.contains(keyword) {
             if debug_mode {
-                println!(
-                    "DEBUG: Skipping compound processing for excluded keyword: '{}'",
-                    keyword
-                );
+                println!("DEBUG: Skipping compound processing for excluded keyword: '{keyword}'");
             }
             continue; // Skip this keyword entirely
         }
@@ -521,50 +579,42 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
             let camel_parts = crate::search::tokenization::split_camel_case(keyword);
             let compound_parts = if camel_parts.len() <= 1 {
                 // Not a camelCase word, check if it's in vocabulary
-                crate::search::tokenization::split_compound_word(
-                    keyword,
-                    crate::search::tokenization::load_vocabulary(),
-                )
+                // VOCABULARY CACHE OPTIMIZATION: Use cached compound word splitting for filtering
+                crate::search::tokenization::split_compound_word_for_filtering(keyword)
             } else {
                 camel_parts
             };
 
             if compound_parts.len() > 1 {
                 if debug_mode {
-                    println!("DEBUG: Processing compound word: '{}'", keyword);
+                    println!("DEBUG: Processing compound word: '{keyword}'");
                 }
 
                 for part in compound_parts {
                     // Check if the part itself is excluded before adding its pattern
                     if part.len() >= 3 && !plan.excluded_terms.contains(&part) {
                         let part_pattern = regex_escape(&part);
-                        let pattern = format!("({})", part_pattern);
+                        let pattern = format!("({part_pattern})");
 
                         if debug_mode {
                             println!(
-                                "DEBUG: Adding compound part pattern: '{}' from '{}'",
-                                pattern, part
+                                "DEBUG: Adding compound part pattern: '{pattern}' from '{part}'"
                             );
                         }
                         compound_patterns.push((pattern, HashSet::from([idx])));
                     } else if debug_mode && plan.excluded_terms.contains(&part) {
                         println!(
-                            "DEBUG: Skipping excluded compound part: '{}' from keyword '{}'",
-                            part, keyword
+                            "DEBUG: Skipping excluded compound part: '{part}' from keyword '{keyword}'"
                         );
                     } else if debug_mode {
                         println!(
-                            "DEBUG: Skipping short compound part: '{}' from keyword '{}'",
-                            part, keyword
+                            "DEBUG: Skipping short compound part: '{part}' from keyword '{keyword}'"
                         );
                     }
                 }
             }
         } else if debug_mode && is_exact_search(&plan.ast) {
-            println!(
-                "DEBUG: Skipping compound word processing for exact search term: '{}'",
-                keyword
-            );
+            println!("DEBUG: Skipping compound word processing for exact search term: '{keyword}'");
         }
     }
 
@@ -650,7 +700,7 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
             deduplicated_results.len()
         );
         for (pattern, indices) in &deduplicated_results {
-            println!("DEBUG: Pattern: '{}', Indices: {:?}", pattern, indices);
+            println!("DEBUG: Pattern: '{pattern}', Indices: {indices:?}");
         }
     }
 

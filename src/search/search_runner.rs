@@ -1,22 +1,26 @@
-use crate::search::file_list_cache;
 use anyhow::Result;
+use probe_code::search::file_list_cache;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 // No need for term_exceptions import
 
-use crate::models::{LimitedSearchResults, SearchResult};
-use crate::search::{
+use probe_code::models::{LimitedSearchResults, SearchResult};
+use probe_code::path_resolver::resolve_path;
+use probe_code::search::{
     cache,
+    early_ranker,
     // file_list_cache, // Add the new file_list_cache module (unused)
     file_processing::{process_file_with_results, FileProcessingParams},
     query::{create_query_plan, create_structured_patterns, QueryPlan},
     result_ranking::rank_search_results,
     search_limiter::apply_limits,
     search_options::SearchOptions,
+    simd_pattern_matching::SimdPatternMatcher,
     timeout,
 };
-use probe::path_resolver::resolve_path;
 
 /// Struct to hold timing information for different stages of the search process
 pub struct SearchTimings {
@@ -26,6 +30,7 @@ pub struct SearchTimings {
     pub filename_matching: Option<Duration>,
     pub early_filtering: Option<Duration>,
     pub early_caching: Option<Duration>,
+    pub early_ranking: Option<Duration>,
     pub result_processing: Option<Duration>,
     // Granular result processing timings
     pub result_processing_file_io: Option<Duration>,
@@ -63,9 +68,11 @@ pub struct SearchTimings {
 /// Helper function to format duration in a human-readable way
 pub fn format_duration(duration: Duration) -> String {
     if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
+        let millis = duration.as_millis();
+        format!("{millis}ms")
     } else {
-        format!("{:.2}s", duration.as_secs_f64())
+        let secs = duration.as_secs_f64();
+        format!("{secs:.2}s")
     }
 }
 
@@ -100,6 +107,10 @@ pub fn print_timings(timings: &SearchTimings) {
 
     if let Some(duration) = timings.early_caching {
         println!("Early caching:         {}", format_duration(duration));
+    }
+
+    if let Some(duration) = timings.early_ranking {
+        println!("Early ranking:         {}", format_duration(duration));
     }
 
     if let Some(duration) = timings.result_processing {
@@ -224,6 +235,8 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         dry_run: _, // We don't need this in perform_probe, but need to include it in the pattern
         session,
         timeout,
+        question,
+        no_gitignore,
     } = options;
     // Start the timeout thread
     let timeout_handle = timeout::start_timeout_thread(*timeout);
@@ -239,10 +252,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             if let Ok(env_session_id) = std::env::var("PROBE_SESSION_ID") {
                 if !env_session_id.is_empty() {
                     if debug_mode {
-                        println!(
-                            "DEBUG: Using session ID from environment: {}",
-                            env_session_id
-                        );
+                        println!("DEBUG: Using session ID from environment: {env_session_id}");
                     }
                     // Convert to a static string (this leaks memory, but it's a small amount and only happens once per session)
                     let static_id: &'static str = Box::leak(env_session_id.into_boxed_str());
@@ -252,12 +262,12 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                     match cache::generate_session_id() {
                         Ok((new_id, _is_new)) => {
                             if debug_mode {
-                                println!("DEBUG: Generated new session ID: {}", new_id);
+                                println!("DEBUG: Generated new session ID: {new_id}");
                             }
                             (Some(new_id), true)
                         }
                         Err(e) => {
-                            eprintln!("Error generating session ID: {}", e);
+                            eprintln!("Error generating session ID: {e}");
                             (None, false)
                         }
                     }
@@ -267,12 +277,12 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 match cache::generate_session_id() {
                     Ok((new_id, _is_new)) => {
                         if debug_mode {
-                            println!("DEBUG: Generated new session ID: {}", new_id);
+                            println!("DEBUG: Generated new session ID: {new_id}");
                         }
                         (Some(new_id), true)
                     }
                     Err(e) => {
-                        eprintln!("Error generating session ID: {}", e);
+                        eprintln!("Error generating session ID: {e}");
                         (None, false)
                     }
                 }
@@ -285,10 +295,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         if let Ok(env_session_id) = std::env::var("PROBE_SESSION_ID") {
             if !env_session_id.is_empty() {
                 if debug_mode {
-                    println!(
-                        "DEBUG: Using session ID from environment: {}",
-                        env_session_id
-                    );
+                    println!("DEBUG: Using session ID from environment: {env_session_id}");
                 }
                 // Convert to a static string (this leaks memory, but it's a small amount and only happens once per session)
                 let static_id: &'static str = Box::leak(env_session_id.into_boxed_str());
@@ -308,6 +315,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         filename_matching: None,
         early_filtering: None,
         early_caching: None,
+        early_ranking: None,
         result_processing: None,
         result_processing_file_io: None,
         result_processing_line_collection: None,
@@ -373,6 +381,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             skipped_files: Vec::new(),
             limits_applied: None,
             cached_blocks_skipped: None,
+            files_skipped_early_termination: None,
         });
     }
 
@@ -397,7 +406,10 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             "DEBUG: Pattern generation completed in {}",
             format_duration(pg_duration)
         );
-        println!("DEBUG: Generated {} patterns", structured_patterns.len());
+        println!(
+            "DEBUG: Generated {patterns_len} patterns",
+            patterns_len = structured_patterns.len()
+        );
         if structured_patterns.len() == 1 {
             println!("DEBUG: Successfully created a single combined pattern for all terms");
         }
@@ -431,6 +443,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         custom_ignores,
         *allow_tests,
         lang_param,
+        *no_gitignore,
     )?;
 
     let fs_duration = fs_start.elapsed();
@@ -480,7 +493,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 }
                 Err(err) => {
                     if debug_mode {
-                        println!("DEBUG: Failed to resolve path '{}': {}", path_str, err);
+                        println!("DEBUG: Failed to resolve path '{path_str}': {err}");
                     }
                     // Fall back to the original path
                     path.to_path_buf()
@@ -500,6 +513,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 *allow_tests,
                 &plan.term_indices,
                 lang_param,
+                *no_gitignore,
             )?;
 
         if debug_mode {
@@ -519,7 +533,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 Ok(path) => path,
                 Err(e) => {
                     if debug_mode {
-                        println!("DEBUG: Error resolving path for {:?}: {:?}", pathbuf, e);
+                        println!("DEBUG: Error resolving path for {pathbuf:?}: {e:?}");
                     }
                     continue;
                 }
@@ -530,10 +544,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 Ok(meta) => meta,
                 Err(e) => {
                     if debug_mode {
-                        println!(
-                            "DEBUG: Error getting metadata for {:?}: {:?}",
-                            resolved_path, e
-                        );
+                        println!("DEBUG: Error getting metadata for {resolved_path:?}: {e:?}");
                     }
                     continue;
                 }
@@ -572,7 +583,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             let line_count = file_content.lines().count();
             if line_count == 0 {
                 if debug_mode {
-                    println!("DEBUG: File {:?} is empty, skipping", pathbuf);
+                    println!("DEBUG: File {pathbuf:?} is empty, skipping");
                 }
                 continue;
             }
@@ -584,14 +595,13 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             let mut term_map = if let Some(existing_map) = file_term_map.get(pathbuf) {
                 if debug_mode {
                     println!(
-                        "DEBUG: File {:?} already has term matches from content search, extending",
-                        pathbuf
+                        "DEBUG: File {pathbuf:?} already has term matches from content search, extending"
                     );
                 }
                 existing_map.clone()
             } else {
                 if debug_mode {
-                    println!("DEBUG: Creating new term map for file {:?}", pathbuf);
+                    println!("DEBUG: Creating new term map for file {pathbuf:?}");
                 }
                 HashMap::new()
             };
@@ -605,8 +615,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 
                 if debug_mode {
                     println!(
-                        "DEBUG: Added term index {} to file {:?} with all lines",
-                        term_idx, pathbuf
+                        "DEBUG: Added term index {term_idx} to file {pathbuf:?} with all lines"
                     );
                 }
             }
@@ -616,16 +625,13 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             all_files.insert(pathbuf.clone());
 
             if debug_mode {
-                println!(
-                    "DEBUG: Added file {:?} with matching terms to file_term_map",
-                    pathbuf
-                );
+                println!("DEBUG: Added file {pathbuf:?} with matching terms to file_term_map");
             }
         }
     }
 
     if debug_mode {
-        println!("DEBUG: all_files after filename matches: {:?}", all_files);
+        println!("DEBUG: all_files after filename matches: {all_files:?}");
     }
 
     // Early filtering step - filter both all_files and file_term_map using full AST evaluation (including excluded terms?).
@@ -650,13 +656,10 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 filtered_file_term_map.insert(pathbuf.clone(), term_map.clone());
                 filtered_all_files.insert(pathbuf.clone());
             } else if debug_mode {
-                println!("DEBUG: Early filtering removed file: {:?}", pathbuf);
+                println!("DEBUG: Early filtering removed file: {pathbuf:?}");
             }
         } else if debug_mode {
-            println!(
-                "DEBUG: File {:?} not found in file_term_map during early filtering",
-                pathbuf
-            );
+            println!("DEBUG: File {pathbuf:?} not found in file_term_map during early filtering");
         }
     }
 
@@ -669,7 +672,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             "DEBUG: After early filtering: {} files remain",
             all_files.len()
         );
-        println!("DEBUG: all_files after early filtering: {:?}", all_files);
+        println!("DEBUG: all_files after early filtering: {all_files:?}");
     }
 
     let early_filter_duration = early_filter_start.elapsed();
@@ -749,12 +752,11 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 
         if debug_mode {
             println!(
-                "DEBUG: Starting early caching for session: {} with query: {}",
-                session_id, raw_query
+                "DEBUG: Starting early caching for session: {session_id} with query: {raw_query}"
             );
             // Print cache contents before filtering
             if let Err(e) = cache::debug_print_cache(session_id, &raw_query) {
-                eprintln!("Error printing cache: {}", e);
+                eprintln!("Error printing cache: {e}");
             }
         }
 
@@ -762,13 +764,13 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         match cache::filter_matched_lines_with_cache(&mut file_term_map, session_id, &raw_query) {
             Ok(skipped) => {
                 if debug_mode {
-                    println!("DEBUG: Early caching skipped {} matched lines", skipped);
+                    println!("DEBUG: Early caching skipped {skipped} matched lines");
                 }
                 early_skipped_count = skipped;
             }
             Err(e) => {
                 // Log the error but continue without early caching
-                eprintln!("Error applying early cache: {}", e);
+                eprintln!("Error applying early cache: {e}");
             }
         }
 
@@ -778,7 +780,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         all_files = all_files.intersection(&cached_files).cloned().collect();
 
         if debug_mode {
-            println!("DEBUG: all_files after caching: {:?}", all_files);
+            println!("DEBUG: all_files after caching: {all_files:?}");
         }
     }
 
@@ -792,13 +794,66 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         );
     }
 
-    // Process the files for detailed results
-    let rp_start = Instant::now();
+    // OPTIMIZATION: Early ranking and batch processing
+    let early_ranking_start = Instant::now();
+
+    // Step 1: Calculate early scores for all files
     if debug_mode {
         println!(
-            "DEBUG: Starting result processing for {} files after early caching...",
+            "DEBUG: Starting early ranking for {} files...",
             all_files.len()
         );
+    }
+
+    // Prepare data for early ranking
+    let mut file_matches_vec = Vec::new();
+    let mut file_sizes = HashMap::new();
+
+    // Quick estimate of file sizes (in lines) - we'll use a rough estimate for now
+    // In production, you might want to cache these or get actual line counts
+    for pathbuf in &all_files {
+        if let Some(term_map) = file_term_map.get(pathbuf) {
+            // Convert HashMap<usize, HashSet<usize>> to HashMap<usize, Vec<usize>>
+            let converted_map: HashMap<usize, Vec<usize>> = term_map
+                .iter()
+                .map(|(&term_idx, line_set)| {
+                    let mut lines: Vec<usize> = line_set.iter().copied().collect();
+                    lines.sort(); // Sort for deterministic ordering
+                    (term_idx, lines)
+                })
+                .collect();
+
+            file_matches_vec.push((pathbuf.clone(), converted_map));
+
+            // Estimate file size based on matched lines (rough heuristic)
+            let max_line = term_map
+                .values()
+                .flat_map(|lines| lines.iter())
+                .max()
+                .copied()
+                .unwrap_or(100);
+            file_sizes.insert(pathbuf.clone(), max_line + 100); // Add buffer for unmatched lines
+        }
+    }
+
+    // Perform early ranking
+    let ranked_files =
+        early_ranker::rank_files_early(file_matches_vec, queries, &plan.term_indices, &file_sizes);
+
+    let early_ranking_duration = early_ranking_start.elapsed();
+    timings.early_ranking = Some(early_ranking_duration);
+    if debug_mode {
+        println!(
+            "DEBUG: Early ranking completed in {} - Ranked {} files",
+            format_duration(early_ranking_duration),
+            ranked_files.len()
+        );
+    }
+
+    // Step 2: Process files in batches until limits are satisfied
+    let rp_start = Instant::now();
+    if debug_mode {
+        println!("DEBUG: Starting batch processing of top-ranked files...");
     }
 
     let mut final_results = Vec::new();
@@ -828,216 +883,311 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     let mut total_result_creation_time = Duration::new(0, 0);
     let mut total_synchronization_time = Duration::new(0, 0);
     let mut total_uncovered_lines_time = Duration::new(0, 0);
-    for pathbuf in &all_files {
-        if debug_mode {
-            println!("DEBUG: Processing file: {:?}", pathbuf);
+
+    // Batch processing parameters
+    const BATCH_SIZE: usize = 100;
+    let estimated_files_needed = early_ranker::estimate_files_needed(
+        *max_results,
+        *max_tokens,
+        250, // Average tokens per result estimate
+    );
+
+    let mut files_processed = 0;
+    let mut batch_number = 0;
+    let mut should_continue = true;
+
+    // Track total files available for accurate skipped file count
+    let total_ranked_files = ranked_files.len();
+
+    // Process files in batches
+    for batch in ranked_files.chunks(BATCH_SIZE) {
+        if !should_continue {
+            break;
         }
 
-        // Get the term map for this file
-        if let Some(term_map) = file_term_map.get(pathbuf) {
-            if debug_mode {
-                println!("DEBUG: Term map for file: {:?}", term_map);
-            }
+        batch_number += 1;
+        if debug_mode {
+            println!(
+                "DEBUG: Processing batch {} ({} files)",
+                batch_number,
+                batch.len()
+            );
+        }
 
-            // Gather matched lines - measure line collection time
-            let line_collection_start = Instant::now();
-            let mut all_lines = HashSet::new();
-            for lineset in term_map.values() {
-                all_lines.extend(lineset.iter());
-            }
-            let line_collection_duration = line_collection_start.elapsed();
-            total_line_collection_time += line_collection_duration;
+        let batch_start = Instant::now();
+        let mut batch_results = Vec::new();
 
+        for early_rank_result in batch {
+            let pathbuf = &early_rank_result.path;
             if debug_mode {
                 println!(
-                    "DEBUG: Found {} matched lines in file in {}",
-                    all_lines.len(),
-                    format_duration(line_collection_duration)
+                    "DEBUG: Processing file: {pathbuf:?} (early score: {:.4})",
+                    early_rank_result.score
                 );
             }
 
-            // Process file with matched lines
-            let filename_matched_queries = HashSet::new();
+            // Get the term map for this file
+            if let Some(term_map) = file_term_map.get(pathbuf) {
+                if debug_mode {
+                    println!("DEBUG: Term map for file: {term_map:?}");
+                }
 
-            // Create a list of term pairs for backward compatibility
-            let term_pairs: Vec<(String, String)> = plan
-                .term_indices
-                .keys()
-                .map(|term| (term.clone(), term.clone()))
-                .collect();
+                // Gather matched lines - measure line collection time
+                let line_collection_start = Instant::now();
+                let mut all_lines = HashSet::new();
+                for lineset in term_map.values() {
+                    all_lines.extend(lineset.iter());
+                }
+                let line_collection_duration = line_collection_start.elapsed();
+                total_line_collection_time += line_collection_duration;
 
-            let pparams = FileProcessingParams {
-                path: pathbuf,
-                line_numbers: &all_lines,
-                allow_tests: *allow_tests,
-                term_matches: term_map,
-                num_queries: plan.term_indices.len(),
-                filename_matched_queries,
-                queries_terms: &[term_pairs],
-                preprocessed_queries: None,
-                no_merge: *no_merge,
-                query_plan: &plan,
-            };
+                if debug_mode {
+                    println!(
+                        "DEBUG: Found {} matched lines in file in {}",
+                        all_lines.len(),
+                        format_duration(line_collection_duration)
+                    );
+                }
 
-            if debug_mode {
-                println!("DEBUG: Processing file with params: {:?}", pparams.path);
-            }
+                // Process file with matched lines
+                let filename_matched_queries = HashSet::new();
 
-            // Process file and track granular timings
-            match process_file_with_results(&pparams) {
-                Ok((mut file_res, file_timings)) => {
-                    // Accumulate granular timings from file processing
-                    if let Some(duration) = file_timings.file_io {
-                        total_file_io_time += duration;
-                    }
-                    if let Some(duration) = file_timings.ast_parsing {
-                        total_ast_parsing_time += duration;
-                    }
-                    if let Some(duration) = file_timings.block_extraction {
-                        total_block_extraction_time += duration;
-                    }
+                // Create a list of term pairs for backward compatibility
+                let term_pairs: Vec<(String, String)> = plan
+                    .term_indices
+                    .keys()
+                    .map(|term| (term.clone(), term.clone()))
+                    .collect();
 
-                    // Add the new granular timings for AST parsing sub-steps
-                    if let Some(duration) = file_timings.ast_parsing_language_init {
-                        total_ast_parsing_language_init_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Language init: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.ast_parsing_parser_init {
-                        total_ast_parsing_parser_init_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Parser init: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.ast_parsing_tree_parsing {
-                        total_ast_parsing_tree_parsing_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Tree parsing: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.ast_parsing_line_map_building {
-                        total_ast_parsing_line_map_building_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Line map building: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
+                let pparams = FileProcessingParams {
+                    path: pathbuf,
+                    line_numbers: &all_lines,
+                    allow_tests: *allow_tests,
+                    term_matches: term_map,
+                    num_queries: plan.term_indices.len(),
+                    filename_matched_queries,
+                    queries_terms: &[term_pairs],
+                    preprocessed_queries: None,
+                    no_merge: *no_merge,
+                    query_plan: &plan,
+                };
 
-                    // Add the new granular timings for block extraction sub-steps
-                    if let Some(duration) = file_timings.block_extraction_code_structure {
-                        total_block_extraction_code_structure_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Code structure finding: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
-                    if let Some(duration) = file_timings.block_extraction_filtering {
-                        total_block_extraction_filtering_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Filtering: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.block_extraction_result_building {
-                        total_block_extraction_result_building_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Result building: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
+                if debug_mode {
+                    println!(
+                        "DEBUG: Processing file with params: {}",
+                        pparams.path.display()
+                    );
+                }
 
-                    // Add the detailed result building timings
-                    if let Some(duration) = file_timings.result_building_term_matching {
-                        total_term_matching_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Term matching: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.result_building_compound_processing {
-                        total_compound_processing_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Compound processing: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
-                    if let Some(duration) = file_timings.result_building_line_matching {
-                        total_line_matching_time += duration;
-                        if debug_mode {
-                            println!("DEBUG:     - Line matching: {}", format_duration(duration));
-                        }
-                    }
-                    if let Some(duration) = file_timings.result_building_result_creation {
-                        total_result_creation_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Result creation: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
-                    if let Some(duration) = file_timings.result_building_synchronization {
-                        total_synchronization_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Synchronization: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
-                    if let Some(duration) = file_timings.result_building_uncovered_lines {
-                        total_uncovered_lines_time += duration;
-                        if debug_mode {
-                            println!(
-                                "DEBUG:     - Uncovered lines: {}",
-                                format_duration(duration)
-                            );
-                        }
-                    }
-
-                    if debug_mode {
-                        println!("DEBUG: Got {} results from file processing", file_res.len());
+                // Process file and track granular timings
+                match process_file_with_results(&pparams) {
+                    Ok((mut file_res, file_timings)) => {
+                        // Accumulate granular timings from file processing
                         if let Some(duration) = file_timings.file_io {
-                            println!("DEBUG:   File I/O time: {}", format_duration(duration));
+                            total_file_io_time += duration;
                         }
                         if let Some(duration) = file_timings.ast_parsing {
-                            println!("DEBUG:   AST parsing time: {}", format_duration(duration));
+                            total_ast_parsing_time += duration;
                         }
                         if let Some(duration) = file_timings.block_extraction {
-                            println!(
-                                "DEBUG:   Block extraction time: {}",
-                                format_duration(duration)
-                            );
+                            total_block_extraction_time += duration;
+                        }
+
+                        // Add the new granular timings for AST parsing sub-steps
+                        if let Some(duration) = file_timings.ast_parsing_language_init {
+                            total_ast_parsing_language_init_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Language init: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.ast_parsing_parser_init {
+                            total_ast_parsing_parser_init_time += duration;
+                            if debug_mode {
+                                println!("DEBUG:     - Parser init: {}", format_duration(duration));
+                            }
+                        }
+                        if let Some(duration) = file_timings.ast_parsing_tree_parsing {
+                            total_ast_parsing_tree_parsing_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Tree parsing: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.ast_parsing_line_map_building {
+                            total_ast_parsing_line_map_building_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Line map building: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+
+                        // Add the new granular timings for block extraction sub-steps
+                        if let Some(duration) = file_timings.block_extraction_code_structure {
+                            total_block_extraction_code_structure_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Code structure finding: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.block_extraction_filtering {
+                            total_block_extraction_filtering_time += duration;
+                            if debug_mode {
+                                println!("DEBUG:     - Filtering: {}", format_duration(duration));
+                            }
                         }
                         if let Some(duration) = file_timings.block_extraction_result_building {
-                            println!(
-                                "DEBUG:   Result building time: {}",
-                                format_duration(duration)
-                            );
+                            total_block_extraction_result_building_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Result building: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+
+                        // Add the detailed result building timings
+                        if let Some(duration) = file_timings.result_building_term_matching {
+                            total_term_matching_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Term matching: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.result_building_compound_processing {
+                            total_compound_processing_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Compound processing: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.result_building_line_matching {
+                            total_line_matching_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Line matching: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.result_building_result_creation {
+                            total_result_creation_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Result creation: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.result_building_synchronization {
+                            total_synchronization_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Synchronization: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        if let Some(duration) = file_timings.result_building_uncovered_lines {
+                            total_uncovered_lines_time += duration;
+                            if debug_mode {
+                                println!(
+                                    "DEBUG:     - Uncovered lines: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+
+                        if debug_mode {
+                            println!("DEBUG: Got {} results from file processing", file_res.len());
+                            if let Some(duration) = file_timings.file_io {
+                                println!("DEBUG:   File I/O time: {}", format_duration(duration));
+                            }
+                            if let Some(duration) = file_timings.ast_parsing {
+                                println!(
+                                    "DEBUG:   AST parsing time: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                            if let Some(duration) = file_timings.block_extraction {
+                                println!(
+                                    "DEBUG:   Block extraction time: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                            if let Some(duration) = file_timings.block_extraction_result_building {
+                                println!(
+                                    "DEBUG:   Result building time: {}",
+                                    format_duration(duration)
+                                );
+                            }
+                        }
+                        batch_results.append(&mut file_res);
+                    }
+                    Err(e) => {
+                        if debug_mode {
+                            println!("DEBUG: Error processing file: {e:?}");
                         }
                     }
-                    final_results.append(&mut file_res);
                 }
-                Err(e) => {
-                    if debug_mode {
-                        println!("DEBUG: Error processing file: {:?}", e);
-                    }
+            } else {
+                // This should never happen, but keep for safety
+                if debug_mode {
+                    println!("DEBUG: ERROR - File {pathbuf:?} not found in file_term_map but was in all_files");
                 }
             }
-        } else {
-            // This should never happen, but keep for safety
+
+            files_processed += 1;
+        }
+
+        // After processing batch, check if we should continue
+        if debug_mode {
+            println!(
+                "DEBUG: Batch {} completed in {} - Got {} results",
+                batch_number,
+                format_duration(batch_start.elapsed()),
+                batch_results.len()
+            );
+        }
+
+        // Add batch results to final results
+        final_results.append(&mut batch_results);
+
+        // Check if we have enough results or files processed
+        if files_processed >= estimated_files_needed {
             if debug_mode {
                 println!(
-                    "DEBUG: ERROR - File {:?} not found in file_term_map but was in all_files",
-                    pathbuf
+                    "DEBUG: Stopping batch processing - processed {files_processed} files (estimated need: {estimated_files_needed})"
                 );
+            }
+            should_continue = false;
+        }
+
+        // Also check if we already have way more results than needed
+        // Use a more conservative multiplier aligned with our 1.5x buffer strategy
+        if let Some(max_res) = max_results {
+            let buffered_max_results = (*max_res as f64 * 2.0).ceil() as usize; // 2x buffer for safety
+            if final_results.len() > buffered_max_results {
+                if debug_mode {
+                    println!(
+                        "DEBUG: Stopping batch processing - have {} results (2x buffered max_results: {})",
+                        final_results.len(),
+                        buffered_max_results
+                    );
+                }
+                should_continue = false;
             }
         }
     }
@@ -1163,7 +1313,34 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 
     if !*exact {
         // Only perform ranking if exact flag is not set
-        rank_search_results(&mut final_results, queries, reranker);
+        rank_search_results(&mut final_results, queries, reranker, *question);
+
+        // Apply deterministic secondary sort to ensure consistent ordering for results with equal scores
+        // This prevents non-deterministic behavior when results have the same ranking score
+        final_results.sort_by(|a, b| {
+            // First sort by score (if available), then by file path, then by line number
+            match (a.rank, b.rank) {
+                (Some(rank_a), Some(rank_b)) => {
+                    // If ranks are different, use rank ordering
+                    match rank_a.cmp(&rank_b) {
+                        std::cmp::Ordering::Equal => {
+                            // If ranks are equal, use deterministic secondary sort
+                            (&a.file, a.lines.0).cmp(&(&b.file, b.lines.0))
+                        }
+                        other => other,
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    // If no ranks, sort by file path and line number
+                    (&a.file, a.lines.0).cmp(&(&b.file, b.lines.0))
+                }
+            }
+        });
+    } else {
+        // For exact searches, always apply deterministic sort
+        final_results.sort_by(|a, b| (&a.file, a.lines.0).cmp(&(&b.file, b.lines.0)));
     }
 
     let rr_duration = rr_start.elapsed();
@@ -1196,6 +1373,32 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     // First apply limits to the results
     let mut limited = apply_limits(filtered_results, *max_results, *max_bytes, *max_tokens);
 
+    // Calculate files skipped due to early termination
+    let files_skipped_early_termination = total_ranked_files.saturating_sub(files_processed);
+
+    // Set the files skipped due to early termination
+    limited.files_skipped_early_termination = if files_skipped_early_termination > 0 {
+        Some(files_skipped_early_termination)
+    } else {
+        None
+    };
+
+    // Measure limit application timing immediately after limits are applied
+    let la_duration = la_start.elapsed();
+    timings.limit_application = Some(la_duration);
+
+    if debug_mode {
+        println!(
+            "DEBUG: Limit application completed in {}",
+            format_duration(la_duration)
+        );
+        if files_skipped_early_termination > 0 {
+            println!(
+                "DEBUG: Files skipped due to early termination: {files_skipped_early_termination}"
+            );
+        }
+    }
+
     // Then apply caching AFTER limiting results
     let fc_start = Instant::now();
 
@@ -1209,16 +1412,12 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 
         if debug_mode {
             println!(
-                "DEBUG: Starting final caching for session: {} with query: {}",
-                session_id, raw_query
+                "DEBUG: Starting final caching for session: {session_id} with query: {raw_query}"
             );
-            println!(
-                "DEBUG: Already skipped {} lines in early caching",
-                early_skipped_count
-            );
+            println!("DEBUG: Already skipped {early_skipped_count} lines in early caching");
             // Print cache contents before filtering
             if let Err(e) = cache::debug_print_cache(session_id, &raw_query) {
-                eprintln!("Error printing cache: {}", e);
+                eprintln!("Error printing cache: {e}");
             }
         }
 
@@ -1226,10 +1425,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         match cache::filter_results_with_cache(&limited.results, session_id, &raw_query) {
             Ok((_, cached_skipped)) => {
                 if debug_mode {
-                    println!(
-                        "DEBUG: Final caching found {} cached blocks",
-                        cached_skipped
-                    );
+                    println!("DEBUG: Final caching found {cached_skipped} cached blocks");
                     println!(
                         "DEBUG: Total skipped (early + final): {}",
                         early_skipped_count + cached_skipped
@@ -1240,20 +1436,20 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             }
             Err(e) => {
                 // Log the error but continue without caching
-                eprintln!("Error checking cache: {}", e);
+                eprintln!("Error checking cache: {e}");
             }
         }
 
         // Update the cache with the limited results
         if let Err(e) = cache::add_results_to_cache(&limited.results, session_id, &raw_query) {
-            eprintln!("Error adding results to cache: {}", e);
+            eprintln!("Error adding results to cache: {e}");
         }
 
         if debug_mode {
             println!("DEBUG: Added limited results to cache before merging");
             // Print cache contents after adding new results
             if let Err(e) = cache::debug_print_cache(session_id, &raw_query) {
-                eprintln!("Error printing updated cache: {}", e);
+                eprintln!("Error printing updated cache: {e}");
             }
         }
     }
@@ -1275,17 +1471,6 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         );
     }
 
-    let la_duration = la_start.elapsed();
-    timings.limit_application = Some(la_duration);
-
-    if debug_mode {
-        println!(
-            "DEBUG: Limit application completed in {} - Final result count: {}",
-            format_duration(la_duration),
-            limited.results.len()
-        );
-    }
-
     // Optional block merging - AFTER initial caching
     let bm_start = Instant::now();
     if debug_mode && !limited.results.is_empty() && !*no_merge {
@@ -1293,7 +1478,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     }
 
     let final_results = if !limited.results.is_empty() && !*no_merge {
-        use crate::search::block_merging::merge_ranked_blocks;
+        use probe_code::search::block_merging::merge_ranked_blocks;
         let merged = merge_ranked_blocks(limited.results.clone(), *merge_threshold);
 
         let bm_duration = bm_start.elapsed();
@@ -1313,6 +1498,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             skipped_files: limited.skipped_files,
             limits_applied: limited.limits_applied,
             cached_blocks_skipped: limited.cached_blocks_skipped,
+            files_skipped_early_termination: limited.files_skipped_early_termination,
         };
 
         // Update the cache with the merged results (after merging)
@@ -1325,14 +1511,14 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             };
 
             if let Err(e) = cache::add_results_to_cache(&merged, session_id, &raw_query) {
-                eprintln!("Error adding merged results to cache: {}", e);
+                eprintln!("Error adding merged results to cache: {e}");
             }
 
             if debug_mode {
                 println!("DEBUG: Added merged results to cache after merging");
                 // Print cache contents after adding merged results
                 if let Err(e) = cache::debug_print_cache(session_id, &raw_query) {
-                    eprintln!("Error printing updated cache: {}", e);
+                    eprintln!("Error printing updated cache: {e}");
                 }
             }
         }
@@ -1355,12 +1541,9 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     // Print the session ID to the console if it was generated or provided
     if let Some(session_id) = effective_session {
         if session_was_generated {
-            println!(
-                "Session ID: {} (generated - ALWAYS USE IT in future sessions for caching)",
-                session_id
-            );
+            println!("Session ID: {session_id} (generated - ALWAYS USE IT in future sessions for caching)");
         } else {
-            println!("Session ID: {}", session_id);
+            println!("Session ID: {session_id}");
         }
     }
 
@@ -1377,7 +1560,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 }
 
 /// Helper function to search files using structured patterns from a QueryPlan.
-/// This function uses a RegexSet approach for deterministic pattern matching
+/// This function uses ripgrep's optimized search engine for maximum performance
 /// and collects matches by term indices. It uses the file_list_cache to get a filtered
 /// list of files respecting ignore patterns.
 ///
@@ -1394,6 +1577,7 @@ pub fn search_with_structured_patterns(
     custom_ignores: &[String],
     allow_tests: bool,
     language: Option<&str>,
+    no_gitignore: bool,
 ) -> Result<HashMap<PathBuf, HashMap<usize, HashSet<usize>>>> {
     // Resolve the path if it's a special format (e.g., "go:github.com/user/repo")
     let root_path = if let Some(path_str) = root_path_str.to_str() {
@@ -1410,7 +1594,7 @@ pub fn search_with_structured_patterns(
             }
             Err(err) => {
                 if std::env::var("DEBUG").unwrap_or_default() == "1" {
-                    println!("DEBUG: Failed to resolve path '{}': {}", path_str, err);
+                    println!("DEBUG: Failed to resolve path '{path_str}': {err}");
                 }
                 // Fall back to the original path
                 root_path_str.to_path_buf()
@@ -1420,37 +1604,70 @@ pub fn search_with_structured_patterns(
         // If we can't convert the path to a string, use it as is
         root_path_str.to_path_buf()
     };
-    use rayon::prelude::*;
-    use regex::RegexSet;
-    use std::sync::{Arc, Mutex};
+    use crate::search::ripgrep_searcher::RipgrepSearcher;
 
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
     let search_start = Instant::now();
 
-    // Step 1: Create RegexSet for deterministic pattern matching
+    // Step 1: Create pattern matching infrastructure (SIMD, RipgrepSearcher, or RegexSet)
     if debug_mode {
-        println!("DEBUG: Starting parallel structured pattern search with RegexSet...");
-        println!("DEBUG: Creating RegexSet from {} patterns", patterns.len());
+        println!("DEBUG: Starting parallel structured pattern search...");
+        println!(
+            "DEBUG: Creating pattern matcher from {} patterns",
+            patterns.len()
+        );
     }
 
-    // Extract just the patterns for the RegexSet
-    let pattern_strings: Vec<String> = patterns.iter().map(|(p, _)| format!("(?i){}", p)).collect();
+    // Extract just the patterns for matching
+    let pattern_strings: Vec<String> = patterns.iter().map(|(p, _)| p.clone()).collect();
 
-    // Create a RegexSet for deterministic matching
-    let regex_set = RegexSet::new(&pattern_strings)?;
+    // Try to use SIMD pattern matching first if enabled and patterns are simple enough
+    let use_simd = crate::search::simd_pattern_matching::is_simd_pattern_matching_enabled()
+        && pattern_strings
+            .iter()
+            .all(|p| !p.contains(r"\b") && !p.contains("(?i)"));
+
+    let simd_matcher = if use_simd {
+        if debug_mode {
+            println!(
+                "DEBUG: Using SIMD pattern matching for {} patterns",
+                pattern_strings.len()
+            );
+        }
+        Some(SimdPatternMatcher::with_patterns(pattern_strings.clone()))
+    } else {
+        if debug_mode {
+            println!("DEBUG: Using RipgrepSearcher for complex patterns");
+        }
+        None
+    };
+
+    // Create RipgrepSearcher as fallback when SIMD is not available
+    let searcher = if !use_simd {
+        // Format patterns for case-insensitive ripgrep search
+        let formatted_patterns: Vec<String> =
+            pattern_strings.iter().map(|p| format!("(?i){p}")).collect();
+        Some(RipgrepSearcher::new(&formatted_patterns, true)?)
+    } else {
+        None
+    };
 
     // Create a mapping from pattern index to term indices
     let pattern_to_terms: Vec<HashSet<usize>> =
         patterns.iter().map(|(_, terms)| terms.clone()).collect();
 
     if debug_mode {
-        println!("DEBUG: RegexSet created successfully");
+        if use_simd {
+            println!("DEBUG: SIMD pattern matcher created successfully");
+        } else {
+            println!("DEBUG: RipgrepSearcher created successfully with SIMD optimizations");
+        }
     }
 
     // Step 2: Get filtered file list from cache
     if debug_mode {
         println!("DEBUG: Getting filtered file list from cache");
-        println!("DEBUG: Custom ignore patterns: {:?}", custom_ignores);
+        println!("DEBUG: Custom ignore patterns: {custom_ignores:?}");
     }
 
     // Use file_list_cache to get a filtered list of files, with language filtering if specified
@@ -1459,72 +1676,82 @@ pub fn search_with_structured_patterns(
         allow_tests,
         custom_ignores,
         language,
+        no_gitignore,
     )?;
 
     if debug_mode {
         println!("DEBUG: Got {} files from cache", file_list.files.len());
-        println!("DEBUG: Starting parallel file processing with RegexSet");
+        if use_simd {
+            println!("DEBUG: Starting parallel file processing with SIMD");
+        } else {
+            println!("DEBUG: Starting parallel file processing with ripgrep");
+        }
     }
 
-    // Step 3: Process files in parallel
-    // Create thread-safe shared resources
-    let regex_set = Arc::new(regex_set);
-    let pattern_to_terms = Arc::new(pattern_to_terms);
-    let file_term_maps = Arc::new(Mutex::new(HashMap::new()));
+    // Step 3: Process files in parallel using either SIMD or ripgrep
+    let result = if use_simd {
+        // Use SIMD-based search with deterministic collection
+        let simd_matcher = Arc::new(simd_matcher);
+        let pattern_to_terms = Arc::new(pattern_to_terms);
 
-    // Also create individual regexes for line number extraction
-    let individual_regexes: Vec<regex::Regex> = pattern_strings
-        .iter()
-        .map(|p| regex::Regex::new(p).unwrap())
-        .collect();
-    let individual_regexes = Arc::new(individual_regexes);
+        // Sort files for deterministic processing order to fix non-deterministic behavior
+        let mut sorted_files = file_list.files.clone();
+        sorted_files.sort();
 
-    file_list.files.par_iter().for_each(|file_path| {
-        let regex_set = Arc::clone(&regex_set);
-        let pattern_to_terms = Arc::clone(&pattern_to_terms);
-        let individual_regexes = Arc::clone(&individual_regexes);
+        // Collect results in parallel first, then sort for deterministic order
+        let results_vec: Vec<_> = sorted_files
+            .par_iter()
+            .filter_map(|file_path| {
+                let simd_matcher = Arc::clone(&simd_matcher);
+                let pattern_to_terms = Arc::clone(&pattern_to_terms);
 
-        // Search file with RegexSet for deterministic matching
-        match search_file_with_regex_set(
-            file_path,
-            &regex_set,
-            &individual_regexes,
-            &pattern_to_terms,
-        ) {
-            Ok(term_map) => {
-                if !term_map.is_empty() {
-                    if debug_mode {
-                        println!(
-                            "DEBUG: File {:?} matched patterns with {} term indices",
-                            file_path,
-                            term_map.len()
-                        );
+                // Search file with SIMD pattern matching
+                match search_file_with_simd(file_path, &simd_matcher, &pattern_to_terms) {
+                    Ok(term_map) => {
+                        if !term_map.is_empty() {
+                            if debug_mode {
+                                println!(
+                                    "DEBUG: File {:?} matched patterns with {} term indices",
+                                    file_path,
+                                    term_map.len()
+                                );
+                            }
+                            Some((file_path.clone(), term_map))
+                        } else {
+                            None
+                        }
                     }
+                    Err(e) => {
+                        if debug_mode {
+                            println!("DEBUG: Error searching file {file_path:?}: {e:?}");
+                        }
+                        None
+                    }
+                }
+            })
+            .collect();
 
-                    // Add to results with proper locking
-                    let mut maps = file_term_maps.lock().unwrap();
-                    maps.insert(file_path.clone(), term_map);
-                }
-            }
-            Err(e) => {
-                if debug_mode {
-                    println!("DEBUG: Error searching file {:?}: {:?}", file_path, e);
-                }
-            }
+        // Convert to BTreeMap for deterministic ordering by file path
+        let mut file_term_maps = std::collections::BTreeMap::new();
+        for (path, term_map) in results_vec {
+            file_term_maps.insert(path, term_map);
         }
-    });
+
+        // Convert BTreeMap back to HashMap for compatibility with existing code
+        file_term_maps.into_iter().collect::<HashMap<_, _>>()
+    } else {
+        // Use ripgrep-based search
+        searcher
+            .as_ref()
+            .unwrap()
+            .search_files_parallel(&file_list.files, &pattern_to_terms)?
+    };
 
     let total_duration = search_start.elapsed();
 
-    // Extract the results from the Arc<Mutex<>>
-    let result = Arc::try_unwrap(file_term_maps)
-        .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
-        .into_inner()
-        .unwrap();
-
     if debug_mode {
         println!(
-            "DEBUG: Parallel search completed in {} - Found matches in {} files",
+            "DEBUG: Parallel ripgrep search completed in {} - Found matches in {} files",
             format_duration(total_duration),
             result.len()
         );
@@ -1533,16 +1760,11 @@ pub fn search_with_structured_patterns(
     Ok(result)
 }
 
-/// Helper function to search a file with a RegexSet for deterministic pattern matching
-/// This function searches a file for matches against a RegexSet and individual regexes
-/// to map the matches to their corresponding term indices.
-///
-/// Using RegexSet ensures deterministic pattern matching across multiple runs,
-/// avoiding the non-deterministic behavior of capturing groups in a combined regex.
-fn search_file_with_regex_set(
+/// Helper function to search a file with SIMD pattern matching
+/// This function uses SIMD optimizations for fast multi-pattern searching
+fn search_file_with_simd(
     file_path: &Path,
-    regex_set: &regex::RegexSet,
-    individual_regexes: &[regex::Regex],
+    simd_matcher: &Option<SimdPatternMatcher>,
     pattern_to_terms: &[HashSet<usize>],
 ) -> Result<HashMap<usize, HashSet<usize>>> {
     let mut term_map = HashMap::new();
@@ -1556,7 +1778,7 @@ fn search_file_with_regex_set(
         Ok(path) => path,
         Err(e) => {
             if debug_mode {
-                println!("DEBUG: Error resolving path for {:?}: {:?}", file_path, e);
+                println!("DEBUG: Error resolving path for {file_path:?}: {e:?}");
             }
             return Err(anyhow::anyhow!("Failed to resolve file path: {}", e));
         }
@@ -1567,10 +1789,7 @@ fn search_file_with_regex_set(
         Ok(meta) => meta,
         Err(e) => {
             if debug_mode {
-                println!(
-                    "DEBUG: Error getting metadata for {:?}: {:?}",
-                    resolved_path, e
-                );
+                println!("DEBUG: Error getting metadata for {resolved_path:?}: {e:?}");
             }
             return Err(anyhow::anyhow!("Failed to get file metadata: {}", e));
         }
@@ -1624,13 +1843,12 @@ fn search_file_with_regex_set(
             continue;
         }
 
-        // First check if any pattern matches using the RegexSet
-        let matches = regex_set.matches(line);
-        if matches.matched_any() {
-            // For each matched pattern, find the specific line numbers using individual regexes
-            for pattern_idx in matches.iter() {
-                // Use the individual regex to find all matches in the line
-                if individual_regexes[pattern_idx].is_match(line) {
+        // Use SIMD pattern matching if available
+        if let Some(ref simd_matcher) = simd_matcher {
+            if simd_matcher.has_match(line) {
+                let simd_matches = simd_matcher.find_all_matches(line);
+                for simd_match in simd_matches {
+                    let pattern_idx = simd_match.pattern_index;
                     // Add matches for all terms associated with this pattern
                     for &term_idx in &pattern_to_terms[pattern_idx] {
                         term_map

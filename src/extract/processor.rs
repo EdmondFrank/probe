@@ -2,10 +2,10 @@
 //!
 //! This module provides functions for processing files and extracting code blocks
 //! based on file paths and optional line numbers.
-use crate::extract::symbol_finder::find_symbol_in_file;
-use crate::language::parser::parse_file_for_code_blocks;
-use crate::models::SearchResult;
 use anyhow::{Context, Result};
+use probe_code::extract::symbol_finder::find_symbol_in_file;
+use probe_code::language::parser::parse_file_for_code_blocks;
+use probe_code::models::SearchResult;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -35,13 +35,13 @@ pub fn process_file_for_extraction(
 
     if debug_mode {
         println!("\n[DEBUG] ===== Processing File for Extraction =====");
-        println!("[DEBUG] File path: {:?}", path);
-        println!("[DEBUG] Start line: {:?}", start_line);
-        println!("[DEBUG] End line: {:?}", end_line);
-        println!("[DEBUG] Symbol: {:?}", symbol);
-        println!("[DEBUG] Allow tests: {}", allow_tests);
-        println!("[DEBUG] Context lines: {}", context_lines);
-        println!("[DEBUG] Specific lines: {:?}", specific_lines);
+        println!("[DEBUG] File path: {path:?}");
+        println!("[DEBUG] Start line: {start_line:?}");
+        println!("[DEBUG] End line: {end_line:?}");
+        println!("[DEBUG] Symbol: {symbol:?}");
+        println!("[DEBUG] Allow tests: {allow_tests}");
+        println!("[DEBUG] Context lines: {context_lines}");
+        println!("[DEBUG] Specific lines: {specific_lines:?}");
     }
 
     // Check if the file exists
@@ -53,7 +53,7 @@ pub fn process_file_for_extraction(
     }
 
     // Read the file content
-    let content = fs::read_to_string(path).context(format!("Failed to read file: {:?}", path))?;
+    let content = fs::read_to_string(path).context(format!("Failed to read file: {path:?}"))?;
     let lines: Vec<&str> = content.lines().collect();
 
     if debug_mode {
@@ -65,7 +65,7 @@ pub fn process_file_for_extraction(
     // If we have a symbol, find it in the file
     if let Some(symbol_name) = symbol {
         if debug_mode {
-            println!("[DEBUG] Looking for symbol: {}", symbol_name);
+            println!("[DEBUG] Looking for symbol: {symbol_name}");
         }
         // Find the symbol in the file
         return find_symbol_in_file(path, symbol_name, &content, allow_tests, context_lines);
@@ -74,10 +74,7 @@ pub fn process_file_for_extraction(
     // If we have a line range (start_line, end_line), gather AST blocks overlapping that range.
     if let (Some(start), Some(end)) = (start_line, end_line) {
         if debug_mode {
-            println!(
-                "[DEBUG] Extracting line range: {}-{} (with AST merging)",
-                start, end
-            );
+            println!("[DEBUG] Extracting line range: {start}-{end} (with AST merging)");
         }
 
         // Clamp line numbers to valid ranges instead of failing
@@ -99,8 +96,7 @@ pub fn process_file_for_extraction(
 
         if debug_mode && (clamped_start != start || clamped_end != end) {
             println!(
-                "[DEBUG] Requested lines {}-{} out of range; clamping to {}-{}",
-                start, end, clamped_start, clamped_end
+                "[DEBUG] Requested lines {start}-{end} out of range; clamping to {clamped_start}-{clamped_end}"
             );
         }
 
@@ -195,8 +191,7 @@ pub fn process_file_for_extraction(
                 // Fallback to literal extraction of lines [start..end]
                 if debug_mode {
                     println!(
-                        "[DEBUG] No AST blocks found for the range {}-{}, falling back to literal lines",
-                        start, end
+                        "[DEBUG] No AST blocks found for the range {start}-{end}, falling back to literal lines"
                     );
                 }
                 let start_idx = start - 1;
@@ -241,18 +236,14 @@ pub fn process_file_for_extraction(
     // Single line extraction
     else if let Some(line_num) = start_line {
         if debug_mode {
-            println!(
-                "[DEBUG] Single line extraction requested: line {}",
-                line_num
-            );
+            println!("[DEBUG] Single line extraction requested: line {line_num}");
         }
         // Clamp line number to valid range instead of failing
         let clamped_line_num = line_num.clamp(1, lines.len());
 
         if debug_mode && clamped_line_num != line_num {
             println!(
-                "[DEBUG] Requested line {} out of bounds; clamping to {}",
-                line_num, clamped_line_num
+                "[DEBUG] Requested line {line_num} out of bounds; clamping to {clamped_line_num}"
             );
         }
 
@@ -311,7 +302,7 @@ pub fn process_file_for_extraction(
                 let tokenized_content =
                     crate::ranking::preprocess_text_with_filename(&merged_content, &filename);
 
-                return Ok(SearchResult {
+                Ok(SearchResult {
                     file: path.to_string_lossy().to_string(),
                     lines: (merged_start, merged_end),
                     node_type: "merged_ast_line".to_string(),
@@ -335,14 +326,13 @@ pub fn process_file_for_extraction(
                     block_id: None,
                     matched_keywords: None,
                     tokenized_content: Some(tokenized_content),
-                });
+                })
             }
             _ => {
                 // If no AST block found, fallback to the line + context
                 if debug_mode {
                     println!(
-                        "[DEBUG] No AST blocks found for line {}, using context-based fallback",
-                        line_num
+                        "[DEBUG] No AST blocks found for line {line_num}, using context-based fallback"
                     );
                 }
 
@@ -368,7 +358,7 @@ pub fn process_file_for_extraction(
                 let tokenized_content =
                     crate::ranking::preprocess_text_with_filename(&context_code, &filename);
 
-                return Ok(SearchResult {
+                Ok(SearchResult {
                     file: path.to_string_lossy().to_string(),
                     lines: (start_ctx, end_ctx),
                     node_type: "context".to_string(),
@@ -392,13 +382,13 @@ pub fn process_file_for_extraction(
                     block_id: None,
                     matched_keywords: None,
                     tokenized_content: Some(tokenized_content),
-                });
+                })
             }
         }
     } else if let Some(lines_set) = specific_lines {
         // We have specific lines to extract
         if debug_mode {
-            println!("[DEBUG] Extracting specific lines: {:?}", lines_set);
+            println!("[DEBUG] Extracting specific lines: {lines_set:?}");
         }
 
         if lines_set.is_empty() {
@@ -511,7 +501,7 @@ pub fn process_file_for_extraction(
                 let tokenized_content =
                     crate::ranking::preprocess_text_with_filename(&merged_content, &filename);
 
-                return Ok(SearchResult {
+                Ok(SearchResult {
                     file: path.to_string_lossy().to_string(),
                     lines: (merged_start, merged_end),
                     node_type: "merged_ast_specific_lines".to_string(),
@@ -535,7 +525,7 @@ pub fn process_file_for_extraction(
                     block_id: None,
                     matched_keywords: None,
                     tokenized_content: Some(tokenized_content),
-                });
+                })
             }
             _ => {
                 // Fallback to literal extraction of the specific lines
@@ -569,7 +559,7 @@ pub fn process_file_for_extraction(
                 let tokenized_content =
                     crate::ranking::preprocess_text_with_filename(&range_content, &filename);
 
-                return Ok(SearchResult {
+                Ok(SearchResult {
                     file: path.to_string_lossy().to_string(),
                     lines: (start, end),
                     node_type: "specific_lines".to_string(),
@@ -593,7 +583,7 @@ pub fn process_file_for_extraction(
                     block_id: None,
                     matched_keywords: None,
                     tokenized_content: Some(tokenized_content),
-                });
+                })
             }
         }
     } else {

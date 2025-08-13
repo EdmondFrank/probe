@@ -31,8 +31,8 @@ pub struct Args {
     #[arg(short = 'n', long = "exclude-filenames")]
     pub exclude_filenames: bool,
 
-    /// BM25 ranking for search results
-    #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25"])]
+    /// Ranking algorithm for search results
+    #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25", "hybrid", "hybrid2", "tfidf", "ms-marco-tinybert", "ms-marco-minilm-l6", "ms-marco-minilm-l12"])]
     pub reranker: String,
 
     /// Use frequency-based search with stemming and stopword removal (enabled by default)
@@ -59,6 +59,10 @@ pub struct Args {
     #[arg(long = "allow-tests")]
     pub allow_tests: bool,
 
+    /// Do not respect .gitignore files and patterns (gitignore is respected by default)
+    #[arg(long = "no-gitignore")]
+    pub no_gitignore: bool,
+
     /// Disable merging of adjacent code blocks after ranking (merging enabled by default)
     #[arg(long = "no-merge", default_value = "false")]
     pub no_merge: bool,
@@ -83,6 +87,10 @@ pub struct Args {
     /// Timeout in seconds for search operation (default: 30)
     #[arg(long = "timeout", default_value = "30")]
     pub timeout: u64,
+
+    /// Natural language question for BERT reranking (uses search keywords if not specified)
+    #[arg(long = "question")]
+    pub question: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -117,8 +125,8 @@ pub enum Commands {
         #[arg(short = 'n', long = "exclude-filenames")]
         exclude_filenames: bool,
 
-        /// BM25 ranking for search results
-        #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25"])]
+        /// Ranking algorithm for search results
+        #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25", "hybrid", "hybrid2", "tfidf", "ms-marco-tinybert", "ms-marco-minilm-l6", "ms-marco-minilm-l12"])]
         reranker: String,
 
         /// Use frequency-based search with stemming and stopword removal (enabled by default)
@@ -162,6 +170,10 @@ pub enum Commands {
         #[arg(long = "allow-tests")]
         allow_tests: bool,
 
+        /// Do not respect .gitignore files and patterns (gitignore is respected by default)
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
+
         /// Disable merging of adjacent code blocks after ranking (merging enabled by default)
         #[arg(long = "no-merge", default_value = "false")]
         no_merge: bool,
@@ -186,6 +198,10 @@ pub enum Commands {
         /// Timeout in seconds for search operation (default: 30)
         #[arg(long = "timeout", default_value = "30")]
         timeout: u64,
+
+        /// Natural language question for BERT reranking (uses search keywords if not specified)
+        #[arg(long = "question")]
+        question: Option<String>,
     },
 
     /// Extract code blocks from files
@@ -203,6 +219,10 @@ pub enum Commands {
         /// Custom patterns to ignore (in addition to .gitignore and common patterns)
         #[arg(short, long)]
         ignore: Vec<String>,
+
+        /// Do not respect .gitignore files and patterns (gitignore is respected by default)
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
 
         /// Number of context lines to include before and after the extracted block
         #[arg(short = 'c', long = "context", default_value = "0")]
@@ -290,6 +310,10 @@ pub enum Commands {
         #[arg(long = "allow-tests")]
         allow_tests: bool,
 
+        /// Do not respect .gitignore files and patterns (gitignore is respected by default)
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
+
         /// Maximum number of results to return
         #[arg(long = "max-results")]
         max_results: Option<usize>,
@@ -298,5 +322,41 @@ pub enum Commands {
         /// Use 'json' or 'xml' for machine-readable output with structured data
         #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["markdown", "plain", "json", "xml", "color"])]
         format: String,
+    },
+
+    /// Run performance benchmarks
+    ///
+    /// This command runs comprehensive performance benchmarks using the Criterion framework.
+    /// It tests various aspects of the search engine including search patterns, result limits,
+    /// different options, timing infrastructure, and language parsing performance.
+    /// Results are saved to the target/criterion directory.
+    Benchmark {
+        /// Specific benchmark to run (default: all)
+        #[arg(long = "bench", value_parser = ["all", "search", "timing", "parsing"])]
+        bench: Option<String>,
+
+        /// Number of iterations for each benchmark (default: auto)
+        #[arg(long = "sample-size")]
+        sample_size: Option<usize>,
+
+        /// Benchmark output format
+        #[arg(long = "format", default_value = "pretty", value_parser = ["pretty", "json", "csv"])]
+        format: String,
+
+        /// Save benchmark results to file
+        #[arg(long = "output")]
+        output: Option<String>,
+
+        /// Compare with previous benchmark results
+        #[arg(long = "compare")]
+        compare: bool,
+
+        /// Baseline to compare against
+        #[arg(long = "baseline")]
+        baseline: Option<String>,
+
+        /// Run only fast benchmarks (shorter duration)
+        #[arg(long = "fast")]
+        fast: bool,
     },
 }

@@ -1,4 +1,4 @@
-use crate::search::query::{preprocess_query, create_term_patterns};
+use probe_code::search::query::{preprocess_query, create_term_patterns};
 use std::collections::HashSet;
 
 #[test]
@@ -14,7 +14,7 @@ fn test_grouped_patterns() {
     // Print the patterns for inspection
     println!("Generated patterns:");
     for (pattern, indices) in &patterns {
-        println!("Pattern: {:?}, Indices: {:?}", pattern, indices);
+        println!("Pattern: {pattern:?}, Indices: {indices:?}");
     }
     
     // Verify we have the expected number of patterns

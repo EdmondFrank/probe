@@ -2,9 +2,9 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use probe::models::SearchResult;
-use probe::search::block_merging::merge_ranked_blocks;
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::models::SearchResult;
+use probe_code::search::block_merging::merge_ranked_blocks;
+use probe_code::search::{perform_probe, SearchOptions};
 
 #[test]
 fn test_merge_ranked_blocks() {
@@ -191,7 +191,9 @@ fn test_integration_with_search_flow() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run a search that should produce multiple overlapping blocks
@@ -304,7 +306,9 @@ fn test_no_merge_flag() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run a search that should produce merged blocks
@@ -329,7 +333,9 @@ fn test_no_merge_flag() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run a search that should not merge blocks

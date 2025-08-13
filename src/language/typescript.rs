@@ -37,16 +37,22 @@ impl LanguageImpl for TypeScriptLanguage {
         matches!(
             node.kind(),
             "function_declaration"
+                | "object"
+                | "array"
+                | "function_expression"
                 | "method_definition"
                 | "class_declaration"
                 | "arrow_function"
                 | "function"
                 | "export_statement"
-                | "variable_declaration"
-                | "lexical_declaration"
+                | "jsx_element"
+                | "jsx_self_closing_element"
                 | "interface_declaration"  // TypeScript specific
                 | "type_alias_declaration" // TypeScript specific
                 | "enum_declaration" // TypeScript specific
+                | "declare_statement" // TypeScript declare functions/variables
+                | "namespace_declaration" // TypeScript namespaces
+                | "module_declaration" // Alternative name for namespace in some parsers
         )
     }
 
@@ -86,7 +92,7 @@ impl LanguageImpl for TypeScriptLanguage {
                     let name = child.utf8_text(source).unwrap_or("");
                     if name == "describe" || name == "it" || name == "test" || name == "expect" {
                         if debug_mode {
-                            println!("DEBUG: Test node detected (TypeScript): {} call", name);
+                            println!("DEBUG: Test node detected (TypeScript): {name} call");
                         }
                         return true;
                     }

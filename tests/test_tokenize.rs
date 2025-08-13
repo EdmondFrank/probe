@@ -1,6 +1,6 @@
 fn main() {
     // Import the tokenize function from our probe crate
-    use probe::ranking::tokenize;
+    use probe_code::ranking::tokenize;
 
     // Test strings
     let test_strings = ["The quick brown fox jumps over the lazy dog",
@@ -18,7 +18,7 @@ fn main() {
         let tokens = tokenize(test_str);
 
         println!("Tokens after stop word removal and stemming:");
-        println!("{:?}", tokens);
+        println!("{tokens:?}");
         println!("Number of tokens: {}\n", tokens.len());
     }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 // The integration test needs access to the library crate
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::{perform_probe, SearchOptions};
 
 // Helper function to create test files
 fn create_test_file(dir: &TempDir, filename: &str, content: &str) -> PathBuf {
@@ -151,7 +151,9 @@ fn test_search_single_term() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search for a single term
@@ -215,7 +217,9 @@ fn test_search_multiple_terms() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search for multiple terms
@@ -261,7 +265,9 @@ fn test_search_files_only() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search for files only
@@ -311,7 +317,7 @@ fn test_search_include_filenames() {
     );
 
     // Print the file path for debugging
-    println!("Created test file at: {:?}", search_file_path);
+    println!("Created test file at: {search_file_path:?}");
 
     // Create search query
     let queries = vec!["search".to_string()];
@@ -336,7 +342,9 @@ fn test_search_include_filenames() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search with filename matching enabled
@@ -392,7 +400,9 @@ fn test_search_with_limits() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search with limits
@@ -442,7 +452,9 @@ fn test_frequency_search() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search using frequency-based search
@@ -500,7 +512,9 @@ func main() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search for both terms in "all terms" mode
@@ -541,7 +555,9 @@ fn test_search_with_custom_ignores() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Search with custom ignore patterns
@@ -658,7 +674,9 @@ fn calculate_product(a: i32, b: i32) -> i32 {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Perform search

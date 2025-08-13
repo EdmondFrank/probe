@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 
-use probe::extract::{handle_extract, ExtractOptions};
+use probe_code::extract::{handle_extract, ExtractOptions};
 
 #[test]
 fn test_deduplication_of_nested_extractions() {
@@ -51,6 +51,7 @@ fn standalone_function() {
         keep_input: false,
         prompt: None,
         instructions: None,
+        no_gitignore: false,
     };
 
     // Call handle_extract
@@ -119,8 +120,8 @@ fn standalone_function() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Print the output for debugging
-    println!("Command stdout: {}", stdout);
-    println!("Command stderr: {}", stderr);
+    println!("Command stdout: {stdout}");
+    println!("Command stderr: {stderr}");
 
     // Check for deduplication logs in stdout (not stderr)
     assert!(

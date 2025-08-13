@@ -1,5 +1,5 @@
-use crate::models::SearchResult;
-use std::collections::HashMap;
+use probe_code::models::SearchResult;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -37,8 +37,8 @@ pub fn merge_ranked_blocks(
     // Store the original count before we move results
     let original_count = results.len();
 
-    // Group results by file
-    let mut file_blocks: HashMap<String, Vec<SearchResult>> = HashMap::new();
+    // Group results by file - use BTreeMap for deterministic iteration order
+    let mut file_blocks: BTreeMap<String, Vec<SearchResult>> = BTreeMap::new();
 
     for result in results {
         file_blocks
@@ -229,8 +229,7 @@ pub fn should_merge_blocks(block1: &SearchResult, block2: &SearchResult, thresho
         println!("DEBUG: Considering merging blocks - Block1: type='{}' lines {}-{}, Block2: type='{}' lines {}-{}, threshold: {}",
                  block1.node_type, start1, end1, block2.node_type, start2, end2, threshold);
         println!(
-            "DEBUG: Should merge: {} (distance: {}, threshold: {})",
-            should_merge, distance, threshold
+            "DEBUG: Should merge: {should_merge} (distance: {distance}, threshold: {threshold})"
         );
     }
 
@@ -281,7 +280,8 @@ fn merge_block_content(block1: &SearchResult, block2: &SearchResult) -> String {
     let lines2: Vec<&str> = block2.code.lines().collect();
 
     // Map lines to their absolute positions in the file
-    let mut line_map: HashMap<usize, String> = HashMap::new();
+    // Use BTreeMap for deterministic iteration order to fix non-deterministic merging behavior
+    let mut line_map: BTreeMap<usize, String> = BTreeMap::new();
 
     for (i, line) in lines1.iter().enumerate() {
         let abs_pos = start1 + i;
@@ -316,7 +316,7 @@ fn merge_block_content(block1: &SearchResult, block2: &SearchResult) -> String {
                 .unwrap_or_else(|_| PathBuf::from(file_path))
         );
         println!("DEBUG: File exists: {}", file_path.exists());
-        println!("DEBUG: File can be opened: {}", file_content_available);
+        println!("DEBUG: File can be opened: {file_content_available}");
     }
 
     while current_line <= merged_end {
@@ -397,12 +397,11 @@ fn merge_block_content(block1: &SearchResult, block2: &SearchResult) -> String {
                 // For small gaps where we couldn't read the file or no lines were read,
                 // include a special placeholder indicating we want to include these lines
                 merged_lines.push(format!(
-                    "... lines {}-{} should be included ...",
-                    gap_start, gap_end
+                    "... lines {gap_start}-{gap_end} should be included ..."
                 ));
             } else {
                 // Add a more informative placeholder showing how many lines were skipped for larger gaps
-                merged_lines.push(format!("... lines {}-{} skipped...", gap_start, gap_end));
+                merged_lines.push(format!("... lines {gap_start}-{gap_end} skipped..."));
             }
 
             // Move past the gap

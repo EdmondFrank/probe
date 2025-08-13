@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::{perform_probe, SearchOptions};
 
 /// Create test files with different content for testing queries
 fn create_test_files(temp_dir: &Path) {
@@ -53,7 +53,7 @@ fn test_quoted_term_with_negative_keyword() {
     let custom_ignores: Vec<String> = vec![];
 
     // Print the test files for debugging
-    println!("Test files created in: {:?}", temp_path);
+    println!("Test files created in: {temp_path:?}");
     for entry in std::fs::read_dir(temp_path).unwrap() {
         let entry = entry.unwrap();
         println!("  {:?}", entry.path());
@@ -86,11 +86,13 @@ fn test_quoted_term_with_negative_keyword() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
     println!(
         "Path: {:?}, frequency_search: {}",
         options.path, options.frequency_search
@@ -167,11 +169,13 @@ fn test_negative_quoted_term() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
 
     // Run the search
     let search_results = perform_probe(&options).unwrap();

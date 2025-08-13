@@ -29,16 +29,22 @@ impl LanguageImpl for JavaScriptLanguage {
         matches!(
             node.kind(),
             "function_declaration"
+                | "object"
+                | "array"
+                | "function_expression"
                 | "method_definition"
                 | "class_declaration"
                 | "arrow_function"
                 | "function"
                 | "export_statement"
-                | "variable_declaration"
-                | "lexical_declaration"
-                | "property_identifier"  // Added for JavaScript method names
-                | "class_body"           // Added for JavaScript class body
-                | "class" // Added for JavaScript class
+                | "jsx_element"
+                | "jsx_self_closing_element"
+                | "property_identifier"
+                | "class_body"
+                | "class"
+                | "expression_statement"
+                | "block"
+                | "statement_block"
         )
     }
 
@@ -77,7 +83,7 @@ impl LanguageImpl for JavaScriptLanguage {
                     let name = child.utf8_text(source).unwrap_or("");
                     if name == "describe" || name == "it" || name == "test" || name == "expect" {
                         if debug_mode {
-                            println!("DEBUG: Test node detected (JavaScript): {} call", name);
+                            println!("DEBUG: Test node detected (JavaScript): {name} call");
                         }
                         return true;
                     }

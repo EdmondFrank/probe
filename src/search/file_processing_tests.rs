@@ -1,11 +1,14 @@
+use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
-use crate::search::elastic_query;
-use crate::search::file_processing::process_file_with_results;
-use crate::search::query::QueryPlan;
+use probe_code::search::elastic_query;
+use probe_code::search::file_processing::process_file_with_results;
+use probe_code::search::query::QueryPlan;
 
 // Helper function to create a test file
 pub fn create_test_file(dir: &TempDir, filename: &str, content: &str) -> std::path::PathBuf {
@@ -32,11 +35,23 @@ pub fn create_test_query_plan(terms: &[&str]) -> QueryPlan {
         exact: false,
     };
 
+    // Pre-compute metadata
+    let has_required_anywhere = ast.has_required_term();
+    let has_only_excluded_terms = ast.is_only_excluded_terms();
+    let required_terms_indices = HashSet::new();
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
     QueryPlan {
         ast,
         term_indices,
         excluded_terms: HashSet::new(),
         exact: false,
+        is_simple_query: true,
+        required_terms: HashSet::new(),
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     }
 }
 
@@ -356,7 +371,7 @@ function processResults(results) {
             term_matches: &term_matches,
             num_queries: 2, // "process" and "data"
             filename_matched_queries: HashSet::new(),
-            queries_terms: &[term_pairs.clone()],
+            queries_terms: std::slice::from_ref(&term_pairs),
             preprocessed_queries: Some(&preprocessed_queries),
             query_plan: &query_plan,
             no_merge: false,
@@ -375,8 +390,7 @@ function processResults(results) {
                 // so we'll just check that we have at least 1 unique term
                 assert!(
                     block_unique_terms >= 1,
-                    "Expected at least 1 unique term, got {}",
-                    block_unique_terms
+                    "Expected at least 1 unique term, got {block_unique_terms}"
                 );
 
                 // Check that block_total_matches is also set
@@ -395,7 +409,7 @@ fn test_long_lines_are_ignored() {
     let normal_line = "This is a normal line with reasonable length.";
     let long_line = "x".repeat(600); // Line longer than 500 characters
 
-    let content = format!("{}\n{}\n{}", normal_line, long_line, normal_line);
+    let content = format!("{normal_line}\n{long_line}\n{normal_line}");
     let file_path = create_test_file(&temp_dir, "mixed_length.txt", &content);
 
     let mut line_numbers = HashSet::new();

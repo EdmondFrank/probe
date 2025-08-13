@@ -1,4 +1,4 @@
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::{perform_probe, SearchOptions};
 use std::path::PathBuf;
 
 #[test]
@@ -30,6 +30,8 @@ fn test_ip_whitelist_stemming() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
+        no_gitignore: false,
     };
 
     // Enable debug mode to see the actual terms
@@ -63,8 +65,7 @@ fn test_ip_whitelist_stemming() {
             // So we expect 3 unique terms: "ip", "white", and "list"
             assert!(
                 block_unique_terms >= 1,
-                "Expected at least 1 unique term, got {}",
-                block_unique_terms
+                "Expected at least 1 unique term, got {block_unique_terms}"
             );
         } else {
             panic!("block_unique_terms should be set");
@@ -75,8 +76,7 @@ fn test_ip_whitelist_stemming() {
             // With compound word splitting, we expect at least 1 match
             assert!(
                 block_total_matches >= 1,
-                "Expected at least 1 total match, got {}",
-                block_total_matches
+                "Expected at least 1 total match, got {block_total_matches}"
             );
         } else {
             panic!("block_total_matches should be set");
@@ -119,6 +119,8 @@ fn test_negative_terms_exclude_files() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
+        no_gitignore: false,
     };
 
     // Enable debug mode to see the actual terms

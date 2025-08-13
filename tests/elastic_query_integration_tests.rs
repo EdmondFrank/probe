@@ -1,11 +1,14 @@
+use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
-use probe::search::elastic_query::Expr;
-use probe::search::query::QueryPlan;
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::elastic_query::Expr;
+use probe_code::search::query::QueryPlan;
+use probe_code::search::{perform_probe, SearchOptions};
 
 /// Create test files with different content for testing queries
 fn create_test_files(temp_dir: &Path) {
@@ -96,7 +99,7 @@ fn test_required_term_query() {
     let custom_ignores: Vec<String> = vec![];
 
     // Print the query for debugging
-    println!("Testing query: {:?}", queries);
+    println!("Testing query: {queries:?}");
 
     // Create SearchOptions
     let options = SearchOptions {
@@ -117,11 +120,13 @@ fn test_required_term_query() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the temp_path for debugging
-    println!("Temp path: {:?}", temp_path);
+    println!("Temp path: {temp_path:?}");
 
     // List files in the temp directory
     println!("Files in temp directory:");
@@ -192,7 +197,7 @@ fn test_excluded_term_query() {
     let custom_ignores: Vec<String> = vec![];
 
     // Print the test files for debugging
-    println!("Test files created in: {:?}", temp_path);
+    println!("Test files created in: {temp_path:?}");
     for entry in std::fs::read_dir(temp_path).unwrap() {
         let entry = entry.unwrap();
         println!("  {:?}", entry.path());
@@ -225,11 +230,13 @@ fn test_excluded_term_query() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
     println!(
         "Path: {:?}, frequency_search: {}",
         options.path, options.frequency_search
@@ -317,11 +324,13 @@ fn test_or_query() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the test files for debugging
-    println!("Test files created in: {:?}", temp_path);
+    println!("Test files created in: {temp_path:?}");
     for entry in std::fs::read_dir(temp_path).unwrap() {
         let entry = entry.unwrap();
         println!("  {:?}", entry.path());
@@ -336,7 +345,7 @@ fn test_or_query() {
     }
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
     println!(
         "Path: {:?}, frequency_search: {}",
         options.path, options.frequency_search
@@ -361,7 +370,7 @@ fn test_or_query() {
     // Debug output to see what files were found
     println!("Found files with 'keywordAlpha OR keywordBeta':");
     for name in &file_names {
-        println!("  {}", name);
+        println!("  {name}");
     }
 
     // Check that we found files with keywordAlpha OR keywordBeta
@@ -417,11 +426,13 @@ fn test_complex_query_or() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the test files for debugging
-    println!("Test files created in: {:?}", temp_path);
+    println!("Test files created in: {temp_path:?}");
     for entry in std::fs::read_dir(temp_path).unwrap() {
         let entry = entry.unwrap();
         println!("  {:?}", entry.path());
@@ -436,7 +447,7 @@ fn test_complex_query_or() {
     }
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
     println!(
         "Path: {:?}, frequency_search: {}",
         options.path, options.frequency_search
@@ -460,7 +471,7 @@ fn test_complex_query_or() {
     // Debug output to see what files were found
     println!("Found files with 'keywordAlpha OR keywordBeta':");
     for name in &file_names {
-        println!("  {}", name);
+        println!("  {name}");
     }
 
     // With explicit OR syntax, should find all files with keywordAlpha OR keywordBeta
@@ -515,11 +526,13 @@ fn test_complex_query_exclusion() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Print the query for debugging
-    println!("Executing search with query: {:?}", queries);
+    println!("Executing search with query: {queries:?}");
     println!(
         "Path: {:?}, frequency_search: {}",
         options.path, options.frequency_search
@@ -531,8 +544,7 @@ fn test_complex_query_exclusion() {
     // Check that we got results
     assert!(
         !search_results.results.is_empty(),
-        "Search should return results for query: {:?}",
-        queries
+        "Search should return results for query: {queries:?}"
     );
 
     let file_names: Vec<&str> = search_results
@@ -544,7 +556,7 @@ fn test_complex_query_exclusion() {
     // Debug output to see what files were found
     println!("Found files with 'keywordAlpha -keywordGamma':");
     for name in &file_names {
-        println!("  {}", name);
+        println!("  {name}");
     }
 
     // Should find file1 (has keywordAlpha and no keywordGamma)
@@ -614,7 +626,9 @@ fn test_function() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -635,7 +649,7 @@ fn test_function() {
     // Debug output to see what files were found
     println!("Found files with 'key OR word OR score':");
     for name in &file_names {
-        println!("  {}", name);
+        println!("  {name}");
     }
 
     // Should find the file with at least one of the terms: key, word, or score
@@ -687,6 +701,11 @@ fn test_filter_code_block_with_ast() {
     term_indices.insert("keywordBeta".to_string(), 1);
 
     // Create a QueryPlan
+    let has_required_anywhere = ast.has_required_term();
+    let has_only_excluded_terms = ast.is_only_excluded_terms();
+    let required_terms_indices = HashSet::new();
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
     let plan = QueryPlan {
         ast,
         term_indices,
@@ -696,6 +715,12 @@ fn test_filter_code_block_with_ast() {
             set
         },
         exact: false,
+        is_simple_query: false,
+        required_terms: HashSet::new(),
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     };
 
     // Create term matches for a block
@@ -712,7 +737,7 @@ fn test_filter_code_block_with_ast() {
     let debug_mode = false;
 
     // Import the function from probe crate
-    use probe::search::file_processing::filter_code_block_with_ast;
+    use probe_code::search::file_processing::filter_code_block_with_ast;
 
     // The block should match because it has keywordAlpha but not keywordBeta
     assert!(
@@ -763,6 +788,11 @@ fn test_filter_tokenized_block() {
     term_indices.insert("keywordBeta".to_string(), 1);
 
     // Create a QueryPlan
+    let has_required_anywhere = ast.has_required_term();
+    let has_only_excluded_terms = ast.is_only_excluded_terms();
+    let required_terms_indices = HashSet::new();
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
     let plan = QueryPlan {
         ast,
         term_indices: term_indices.clone(),
@@ -772,10 +802,16 @@ fn test_filter_tokenized_block() {
             set
         },
         exact: false,
+        is_simple_query: false,
+        required_terms: HashSet::new(),
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     };
 
     // Import the function from probe crate
-    use probe::search::file_processing::filter_tokenized_block;
+    use probe_code::search::file_processing::filter_tokenized_block;
 
     // Test case 1: Tokenized content with only keywordAlpha
     let tokenized_content = vec!["keywordAlpha".to_string()];
@@ -839,11 +875,22 @@ fn test_filter_tokenized_block() {
     term_indices_or.insert("keywordGamma".to_string(), 2);
 
     // Create a QueryPlan
+    let has_required_anywhere = ast_or.has_required_term();
+    let has_only_excluded_terms = ast_or.is_only_excluded_terms();
+    let required_terms_indices = HashSet::new();
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
     let plan_or = QueryPlan {
         ast: ast_or,
         term_indices: term_indices_or.clone(),
         excluded_terms: HashSet::new(),
         exact: false,
+        is_simple_query: false,
+        required_terms: HashSet::new(),
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     };
 
     // Test with only keywordGamma

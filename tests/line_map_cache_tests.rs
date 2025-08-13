@@ -1,4 +1,4 @@
-use probe::language::parser::parse_file_for_code_blocks;
+use probe_code::language::parser::parse_file_for_code_blocks;
 use std::collections::HashSet;
 
 #[test]
@@ -71,8 +71,7 @@ struct TestStruct {
             .any(|block| line > block.start_row && line <= block.end_row + 1);
         assert!(
             line_covered,
-            "Line {} not covered by any block in result3",
-            line
+            "Line {line} not covered by any block in result3"
         );
     }
 }

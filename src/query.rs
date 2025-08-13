@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use ast_grep_core::AstGrep;
 use ast_grep_language::SupportLang;
 use colored::*;
-use ignore::Walk;
-use probe::path_resolver::resolve_path;
+use ignore::WalkBuilder;
+use probe_code::path_resolver::resolve_path;
 use rayon::prelude::*; // Added import
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ pub struct QueryOptions<'a> {
     pub max_results: Option<usize>,
     #[allow(dead_code)]
     pub format: &'a str,
+    pub no_gitignore: bool,
 }
 
 /// Convert a language string to the corresponding SupportLang
@@ -244,7 +245,7 @@ pub fn perform_query(options: &QueryOptions) -> Result<Vec<AstMatch>> {
             }
             Err(err) => {
                 if std::env::var("DEBUG").unwrap_or_default() == "1" {
-                    println!("DEBUG: Failed to resolve path '{}': {}", path_str, err);
+                    println!("DEBUG: Failed to resolve path '{path_str}': {err}");
                 }
                 // Fall back to the original path
                 options.path.to_path_buf()
@@ -255,8 +256,22 @@ pub fn perform_query(options: &QueryOptions) -> Result<Vec<AstMatch>> {
         options.path.to_path_buf()
     };
 
-    // Collect file paths
-    let file_paths: Vec<PathBuf> = Walk::new(&resolved_path)
+    // Collect file paths using WalkBuilder to conditionally respect gitignore
+    let mut builder = WalkBuilder::new(&resolved_path);
+
+    // Configure gitignore handling based on the no_gitignore option
+    if !options.no_gitignore {
+        builder.git_ignore(true);
+        builder.git_global(true);
+        builder.git_exclude(true);
+    } else {
+        builder.git_ignore(false);
+        builder.git_global(false);
+        builder.git_exclude(false);
+    }
+
+    let file_paths: Vec<PathBuf> = builder
+        .build()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| !should_ignore_file(entry.path(), options))
@@ -349,19 +364,19 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
 
-                println!("```{}", lang);
+                println!("```{lang}");
                 println!("{}", m.matched_text.trim());
                 println!("```");
                 println!();
             }
         }
         "json" => {
-            // Import the count_tokens function locally
-            use crate::search::search_tokens::count_tokens;
-            let total_tokens = matches
-                .iter()
-                .map(|m| count_tokens(&m.matched_text))
-                .sum::<usize>();
+            // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for query JSON output:
+            // Process all matched text in batch to leverage content deduplication
+            use probe_code::search::search_tokens::sum_tokens_with_deduplication;
+            let matched_texts: Vec<&str> =
+                matches.iter().map(|m| m.matched_text.as_str()).collect();
+            let total_tokens = sum_tokens_with_deduplication(&matched_texts);
 
             // Create standardized results
             let json_matches_standardized: Vec<_> = matches
@@ -371,7 +386,7 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
                         "file": m.file_path.to_string_lossy(),
                         "lines": [m.line_start, m.line_end],
                         "node_type": "match",
-                        "code": m.matched_text,
+                        "content": m.matched_text,
                         "column_start": m.column_start,
                         "column_end": m.column_end
                     })
@@ -385,7 +400,8 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
                     "count": matches.len(),
                     "total_bytes": matches.iter().map(|m| m.matched_text.len()).sum::<usize>(),
                     "total_tokens": total_tokens
-                }
+                },
+                "version": probe_code::version::get_version()
             });
 
             println!("{}", serde_json::to_string_pretty(&wrapper)?);
@@ -412,20 +428,24 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
             println!("  <summary>");
             println!("    <count>{}</count>", matches.len());
             println!(
-                "    <total_bytes>{}</total_bytes>",
+                "    <total_bytes>{}",
                 matches.iter().map(|m| m.matched_text.len()).sum::<usize>()
             );
 
-            // Import the count_tokens function locally to avoid unused import warning
-            use crate::search::search_tokens::count_tokens;
-            println!(
-                "    <total_tokens>{}</total_tokens>",
-                matches
-                    .iter()
-                    .map(|m| count_tokens(&m.matched_text))
-                    .sum::<usize>()
-            );
+            // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for query XML output:
+            // Process all matched text in batch to leverage content deduplication
+            use probe_code::search::search_tokens::sum_tokens_with_deduplication;
+            let matched_texts: Vec<&str> =
+                matches.iter().map(|m| m.matched_text.as_str()).collect();
+            let total_tokens = sum_tokens_with_deduplication(&matched_texts);
+
+            println!("    <total_tokens>{total_tokens}");
             println!("  </summary>");
+
+            println!(
+                "  <version>{}</version>",
+                probe_code::version::get_version()
+            );
 
             println!("</probe_results>");
         }
@@ -439,6 +459,7 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
 }
 
 /// Handle the query command
+#[allow(clippy::too_many_arguments)]
 pub fn handle_query(
     pattern: &str,
     path: &Path,
@@ -447,6 +468,7 @@ pub fn handle_query(
     allow_tests: bool,
     max_results: Option<usize>,
     format: &str,
+    no_gitignore: bool,
 ) -> Result<()> {
     // Only print information for non-JSON/XML formats
     if format != "json" && format != "xml" {
@@ -465,8 +487,11 @@ pub fn handle_query(
         if allow_tests {
             advanced_options.push("Including tests".to_string());
         }
+        if no_gitignore {
+            advanced_options.push("Ignoring .gitignore".to_string());
+        }
         if let Some(max) = max_results {
-            advanced_options.push(format!("Max results: {}", max));
+            advanced_options.push(format!("Max results: {max}"));
         }
 
         if !advanced_options.is_empty() {
@@ -488,6 +513,7 @@ pub fn handle_query(
         allow_tests,
         max_results,
         format,
+        no_gitignore,
     };
 
     let matches = perform_query(&options)?;
@@ -502,7 +528,7 @@ pub fn handle_query(
         } else {
             // For other formats, print the "No results found" message
             println!("{}", "No results found.".yellow().bold());
-            println!("Search completed in {:.2?}", duration);
+            println!("Search completed in {duration:.2?}");
         }
     } else {
         // For non-JSON/XML formats, print search time
@@ -521,13 +547,14 @@ pub fn handle_query(
                 .iter()
                 .map(|m| {
                     // Import the count_tokens function locally to avoid unused import warning
-                    use crate::search::search_tokens::count_tokens;
+                    use probe_code::search::search_tokens::count_tokens;
                     count_tokens(&m.matched_text)
                 })
                 .sum();
 
-            println!("Total bytes returned: {}", total_bytes);
-            println!("Total tokens returned: {}", total_tokens);
+            println!("Total bytes returned: {total_bytes}");
+            println!("Total tokens returned: {total_tokens}");
+            println!("Probe version: {}", probe_code::version::get_version());
         }
     }
 

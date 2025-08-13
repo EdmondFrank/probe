@@ -5,15 +5,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 mod cli;
-mod extract;
-mod language;
-mod models;
-mod query;
-mod ranking;
-mod search;
 
 use cli::{Args, Commands};
-use search::{format_and_print_search_results, perform_probe, SearchOptions};
+use probe_code::{
+    extract::{handle_extract, ExtractOptions},
+    search::{format_and_print_search_results, perform_probe, SearchOptions},
+};
 
 struct SearchParams {
     pattern: String,
@@ -35,6 +32,23 @@ struct SearchParams {
     format: String,
     session: Option<String>,
     timeout: u64,
+    question: Option<String>,
+    no_gitignore: bool,
+}
+
+struct BenchmarkParams {
+    bench: Option<String>,
+    #[allow(dead_code)]
+    sample_size: Option<usize>,
+    #[allow(dead_code)]
+    format: String,
+    output: Option<String>,
+    #[allow(dead_code)]
+    compare: bool,
+    #[allow(dead_code)]
+    baseline: Option<String>,
+    #[allow(dead_code)]
+    fast: bool,
 }
 
 fn handle_search(params: SearchParams) -> Result<()> {
@@ -62,22 +76,25 @@ fn handle_search(params: SearchParams) -> Result<()> {
         advanced_options.push("Frequency search disabled".to_string());
     }
     if let Some(lang) = &params.language {
-        advanced_options.push(format!("Language: {}", lang));
+        advanced_options.push(format!("Language: {lang}"));
     }
     if params.allow_tests {
         advanced_options.push("Including tests".to_string());
+    }
+    if params.no_gitignore {
+        advanced_options.push("Ignoring .gitignore".to_string());
     }
     if params.no_merge {
         advanced_options.push("No block merging".to_string());
     }
     if let Some(threshold) = params.merge_threshold {
-        advanced_options.push(format!("Merge threshold: {}", threshold));
+        advanced_options.push(format!("Merge threshold: {threshold}"));
     }
     if params.dry_run {
         advanced_options.push("Dry run (file names and lines only)".to_string());
     }
     if let Some(session) = &params.session {
-        advanced_options.push(format!("Session: {}", session));
+        advanced_options.push(format!("Session: {session}"));
     }
 
     // Show timeout if it's not the default value of 30 seconds
@@ -117,6 +134,8 @@ fn handle_search(params: SearchParams) -> Result<()> {
         dry_run: params.dry_run,
         session: params.session.as_deref(),
         timeout: params.timeout,
+        question: params.question.as_deref(),
+        no_gitignore: params.no_gitignore,
     };
 
     let limited_results = perform_probe(&search_options)?;
@@ -128,9 +147,9 @@ fn handle_search(params: SearchParams) -> Result<()> {
     let query_plan = if search_options.queries.len() > 1 {
         // Join multiple queries with AND
         let combined_query = search_options.queries.join(" AND ");
-        crate::search::query::create_query_plan(&combined_query, false).ok()
+        probe_code::search::query::create_query_plan(&combined_query, false).ok()
     } else {
-        crate::search::query::create_query_plan(&search_options.queries[0], false).ok()
+        probe_code::search::query::create_query_plan(&search_options.queries[0], false).ok()
     };
 
     if limited_results.results.is_empty() {
@@ -145,12 +164,12 @@ fn handle_search(params: SearchParams) -> Result<()> {
         } else {
             // For other formats, print the "No results found" message
             println!("{}", "No results found.".yellow().bold());
-            println!("Search completed in {:.2?}", duration);
+            println!("Search completed in {duration:.2?}");
         }
     } else {
         // For non-JSON/XML formats, print search time
         if params.format != "json" && params.format != "xml" {
-            println!("Search completed in {:.2?}", duration);
+            println!("Search completed in {duration:.2?}");
             println!();
         }
 
@@ -166,21 +185,59 @@ fn handle_search(params: SearchParams) -> Result<()> {
                 println!();
                 println!("{}", "Limits applied:".yellow().bold());
                 if let Some(max_results) = limits.max_results {
-                    println!("  {} {}", "Max results:".yellow(), max_results);
+                    println!("  {} {max_results}", "Max results:".yellow());
                 }
                 if let Some(max_bytes) = limits.max_bytes {
-                    println!("  {} {}", "Max bytes:".yellow(), max_bytes);
+                    println!("  {} {max_bytes}", "Max bytes:".yellow());
                 }
                 if let Some(max_tokens) = limits.max_tokens {
-                    println!("  {} {}", "Max tokens:".yellow(), max_tokens);
+                    println!("  {} {max_tokens}", "Max tokens:".yellow());
                 }
 
                 println!();
+
+                // Calculate total skipped files (results skipped + files not processed)
+                let results_skipped = limited_results.skipped_files.len();
+                let files_not_processed =
+                    limited_results.files_skipped_early_termination.unwrap_or(0);
+                let total_skipped = results_skipped + files_not_processed;
+
                 println!(
                     "{} {}",
                     "Skipped files due to limits:".yellow().bold(),
-                    limited_results.skipped_files.len()
+                    total_skipped
                 );
+
+                // Show guidance message to get more results
+                if total_skipped > 0 {
+                    if let Some(session_id) = search_options.session {
+                        if !session_id.is_empty() && session_id != "new" {
+                            println!("💡 To get more results from this search query, repeat it with the same params and session ID: {session_id}");
+                        } else {
+                            println!("💡 To get more results from this search query, repeat it with the same params and session ID (see above)");
+                        }
+                    } else {
+                        println!("💡 To get more results from this search query, repeat it with the same params and use --session with the session ID shown above");
+                    }
+                }
+
+                // Show breakdown in debug mode
+                if std::env::var("DEBUG").is_ok() && total_skipped > 0 {
+                    if results_skipped > 0 {
+                        println!(
+                            "  {} {}",
+                            "Results skipped after processing:".yellow(),
+                            results_skipped
+                        );
+                    }
+                    if files_not_processed > 0 {
+                        println!(
+                            "  {} {}",
+                            "Files not processed (early termination):".yellow(),
+                            files_not_processed
+                        );
+                    }
+                }
             }
         }
 
@@ -196,6 +253,84 @@ fn handle_search(params: SearchParams) -> Result<()> {
             }
         }
     }
+
+    // Add helpful tip at the very bottom of output
+    println!();
+    println!("💡 Tip: Use --exact flag when searching for specific function names or variables for more precise results");
+
+    Ok(())
+}
+
+fn handle_benchmark(params: BenchmarkParams) -> Result<()> {
+    use std::process::Command;
+
+    println!("{}", "Running performance benchmarks...".bold().green());
+
+    let bench_type = params.bench.as_deref().unwrap_or("all");
+
+    // Build the cargo bench command
+    let mut cmd = Command::new("cargo");
+    cmd.arg("bench");
+
+    // Add specific benchmark if requested
+    match bench_type {
+        "search" => {
+            cmd.arg("--bench").arg("search_benchmarks");
+        }
+        "timing" => {
+            cmd.arg("--bench").arg("timing_benchmarks");
+        }
+        "parsing" => {
+            cmd.arg("--bench").arg("parsing_benchmarks");
+        }
+        "all" => {
+            // Run all benchmarks (default)
+        }
+        _ => {
+            eprintln!("Unknown benchmark type: {bench_type}");
+            return Ok(());
+        }
+    }
+
+    // Add criterion options after --
+    let criterion_args: Vec<String> = Vec::new();
+
+    // Note: Criterion benchmarks don't support --sample-size from command line
+    // Sample size is configured in the benchmark code itself
+
+    // For now, keep it simple and just run the benchmarks
+    // Advanced features like baseline comparison can be added later
+
+    if !criterion_args.is_empty() {
+        cmd.arg("--");
+        cmd.args(criterion_args);
+    }
+
+    // Execute the benchmark
+    let output = cmd.output()?;
+
+    if !output.status.success() {
+        eprintln!("Benchmark failed:");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        return Ok(());
+    }
+
+    // Print benchmark output
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+
+    // Save output to file if requested
+    if let Some(output_file) = &params.output {
+        use std::fs;
+        fs::write(output_file, &output.stdout)?;
+        println!("Benchmark results saved to: {output_file}");
+    }
+
+    println!();
+    println!("{}", "Benchmark completed successfully!".bold().green());
+    println!(
+        "Results are also available in: {}",
+        "target/criterion/".yellow()
+    );
 
     Ok(())
 }
@@ -242,6 +377,9 @@ async fn main() -> Result<()> {
                 format: args.format,
                 session: args.session,
                 timeout: args.timeout,
+                question: args.question,
+                no_gitignore: args.no_gitignore
+                    || std::env::var("PROBE_NO_GITIGNORE").unwrap_or_default() == "1",
             })?
         }
         Some(Commands::Search {
@@ -264,6 +402,8 @@ async fn main() -> Result<()> {
             format,
             session,
             timeout,
+            question,
+            no_gitignore,
         }) => handle_search(SearchParams {
             pattern,
             paths,
@@ -284,6 +424,9 @@ async fn main() -> Result<()> {
             format,
             session,
             timeout,
+            question,
+            no_gitignore: no_gitignore
+                || std::env::var("PROBE_NO_GITIGNORE").unwrap_or_default() == "1",
         })?,
         Some(Commands::Extract {
             files,
@@ -299,7 +442,8 @@ async fn main() -> Result<()> {
             keep_input,
             prompt,
             instructions,
-        }) => extract::handle_extract(extract::ExtractOptions {
+            no_gitignore,
+        }) => handle_extract(ExtractOptions {
             files,
             custom_ignores: ignore,
             context_lines,
@@ -312,12 +456,14 @@ async fn main() -> Result<()> {
             allow_tests,
             keep_input,
             prompt: prompt.map(|p| {
-                crate::extract::PromptTemplate::from_str(&p).unwrap_or_else(|e| {
-                    eprintln!("Warning: {}", e);
-                    crate::extract::PromptTemplate::Engineer
+                probe_code::extract::PromptTemplate::from_str(&p).unwrap_or_else(|e| {
+                    eprintln!("Warning: {e}");
+                    probe_code::extract::PromptTemplate::Engineer
                 })
             }),
             instructions,
+            no_gitignore: no_gitignore
+                || std::env::var("PROBE_NO_GITIGNORE").unwrap_or_default() == "1",
         })?,
         Some(Commands::Query {
             pattern,
@@ -327,7 +473,8 @@ async fn main() -> Result<()> {
             allow_tests,
             max_results,
             format,
-        }) => query::handle_query(
+            no_gitignore,
+        }) => probe_code::query::handle_query(
             &pattern,
             &path,
             language.as_deref().map(|lang| {
@@ -348,7 +495,25 @@ async fn main() -> Result<()> {
             allow_tests,
             max_results,
             &format,
+            no_gitignore || std::env::var("PROBE_NO_GITIGNORE").unwrap_or_default() == "1",
         )?,
+        Some(Commands::Benchmark {
+            bench,
+            sample_size,
+            format,
+            output,
+            compare,
+            baseline,
+            fast,
+        }) => handle_benchmark(BenchmarkParams {
+            bench,
+            sample_size,
+            format,
+            output,
+            compare,
+            baseline,
+            fast,
+        })?,
     }
 
     Ok(())

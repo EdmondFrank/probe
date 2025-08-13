@@ -117,6 +117,138 @@ Token Usage: Request: 1245 Response: 1532 (Current message only: ~1532)
 Total: 2777 tokens (Cumulative for entire session)
 ```
 
+### OpenTelemetry Tracing
+
+Probe Chat includes built-in OpenTelemetry tracing support to monitor AI model interactions, performance metrics, and usage patterns:
+
+```bash
+# Enable file-based tracing
+probe-chat --trace-file ./traces.jsonl
+
+# Enable remote tracing to an OpenTelemetry collector
+probe-chat --trace-remote http://localhost:4318/v1/traces
+
+# Enable console tracing for debugging
+probe-chat --trace-console
+
+# Combine multiple tracing options
+probe-chat --trace-file --trace-remote --trace-console
+```
+
+#### What Gets Traced
+
+The tracing system captures comprehensive data about AI interactions:
+
+- **AI Model Calls**: Complete request/response cycles with timing
+- **Token Usage**: Detailed token consumption (prompt, completion, total)
+- **Performance Metrics**: Response times, request durations, and throughput
+- **Session Information**: Session IDs, iteration counts, and conversation flow
+- **Model Configuration**: Provider, model name, temperature, and other parameters
+- **Error Tracking**: Failed requests, timeouts, and error details
+
+#### File Tracing
+
+File tracing saves traces to a JSON Lines format file:
+
+```bash
+# Basic file tracing
+probe-chat --trace-file
+
+# Custom file path
+probe-chat --trace-file ./debug-traces.jsonl
+```
+
+Trace files contain one JSON object per line, making them easy to analyze:
+
+```json
+{
+  "traceId": "abc123...",
+  "name": "ai.generateText",
+  "attributes": {
+    "ai.model.id": "claude-3-7-sonnet-20250219",
+    "ai.model.provider": "anthropic",
+    "ai.usage.prompt_tokens": "15",
+    "ai.usage.completion_tokens": "8",
+    "ai.usage.total_tokens": "23"
+  },
+  "events": [
+    {
+      "name": "ai.request.start",
+      "attributes": {
+        "ai.request.messages": "[{\"role\":\"user\",\"content\":\"Hello\"}]"
+      }
+    }
+  ]
+}
+```
+
+#### Remote Tracing
+
+Send traces to any OpenTelemetry-compatible collector:
+
+```bash
+# Jaeger
+probe-chat --trace-remote http://localhost:4318/v1/traces
+
+# Custom collector
+probe-chat --trace-remote https://your-collector.com/v1/traces
+```
+
+For Jaeger setup:
+
+```bash
+# Start Jaeger with Docker
+docker run -d --name jaeger \
+  -p 16686:16686 \
+  -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+
+# Use probe-chat with remote tracing
+probe-chat --trace-remote http://localhost:4318/v1/traces
+
+# View traces at http://localhost:16686
+```
+
+#### Environment Variables
+
+Configure tracing through environment variables:
+
+```bash
+# Enable file tracing
+export OTEL_ENABLE_FILE=true
+export OTEL_FILE_PATH=./traces.jsonl
+
+# Enable remote tracing
+export OTEL_ENABLE_REMOTE=true
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+
+# Enable console tracing
+export OTEL_ENABLE_CONSOLE=true
+
+# Service information
+export OTEL_SERVICE_NAME=probe-chat
+export OTEL_SERVICE_VERSION=1.0.0
+```
+
+#### Analyzing Traces
+
+Use standard tools to analyze trace data:
+
+```bash
+# View all traces
+cat traces.jsonl | jq '.'
+
+# Count successful vs failed requests
+cat traces.jsonl | jq -r '.status.code' | sort | uniq -c
+
+# Extract token usage statistics
+cat traces.jsonl | jq -r '.events[]? | select(.name == "ai.response.complete") | .attributes."ai.usage.total_tokens"'
+
+# Calculate average response time
+cat traces.jsonl | jq -r '((.endTimeUnixNano - .startTimeUnixNano) / 1000000)' | \
+  awk '{sum+=$1} END {print sum/NR " ms"}'
+```
+
 ### Conversation History
 
 The chat maintains context across multiple interactions, allowing for follow-up questions and deeper exploration of topics.
@@ -127,12 +259,42 @@ The terminal interface provides user-friendly colored output with syntax highlig
 
 ### Code Editing (Experimental)
 
-With the `--allow-edit` flag, you can enable the AI agent to modify your code.
+Probe can help you modify your code in two ways:
 
-*   **How it Works**: This flag enables the `implement` tool, which uses **Aider** (an external AI coding assistant) to apply changes based on your requests (e.g., "Refactor this function").
-*   **Requirements**: Requires `aider-chat` to be installed and accessible in your PATH. The chat process also needs write permissions to the target files.
-*   **Caution**: Granting AI write access to your code is powerful but carries risks. Always review changes made by Aider carefully.
-*   **More Info**: See the [CLI Reference](./cli-mode.md#enabling-code-editing---allow-edit) for detailed usage and security considerations.
+#### Local Code Editing (`--allow-edit`)
+
+When you use the `--allow-edit` flag, Probe can make changes directly to your code files.
+
+*   **What it does**: Ask Probe to "fix this bug" or "add error handling" and it will modify your files.
+*   **What you need**: Install a code editing backend tool:
+     - **Claude Code** (default if available): `npm install -g @anthropic-ai/claude-code`
+     - **Aider** (fallback): `pip install aider-chat`
+*   **Backend selection**: Probe automatically detects which tool is available. You can override this with the `implement_tool_backend` environment variable:
+     ```bash
+     # Force Claude Code
+     export implement_tool_backend=claude
+     probe-chat --allow-edit
+     
+     # Force Aider
+     export implement_tool_backend=aider
+     probe-chat --allow-edit
+     ```
+
+#### GitHub Integration
+
+If you're using Probe with GitHub Actions, you can set up code suggestions instead of direct changes.
+
+*   **How it works**: Probe creates suggested changes that appear in your pull requests, just like human code reviews.
+*   **Setup**: See the [GitHub Actions Integration](./integrations/github-actions.md#code-modification-options) guide for configuration details.
+
+#### Stay Safe
+
+*   **Always check changes** before keeping them
+*   **Test your code** after Probe makes modifications
+*   **Start with small requests** to see how it works
+*   **GitHub suggestions are safer** because you review changes before applying them
+
+For complete usage instructions, see the [CLI Reference](./cli-mode.md#code-editing---allow-edit).
 
 ## Configuration
 
@@ -158,6 +320,11 @@ node index.js --web --port 3000
 
 # Specify a directory to search
 node index.js /path/to/your/project
+
+# Enable tracing
+node index.js --trace-file ./traces.jsonl
+node index.js --trace-remote http://localhost:4318/v1/traces
+node index.js --trace-console
 ```
 
 ### Environment Variables

@@ -17,6 +17,41 @@ import { fileURLToPath } from 'url';
 // @ts-ignore - Ignore missing type declarations for @buger/probe
 import { search, query, extract, getBinaryPath, setBinaryPath } from '@buger/probe';
 
+// Parse command-line arguments
+function parseArgs(): { timeout?: number } {
+  const args = process.argv.slice(2);
+  const config: { timeout?: number } = {};
+  
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === '--timeout' || args[i] === '-t') && i + 1 < args.length) {
+      const timeout = parseInt(args[i + 1], 10);
+      if (!isNaN(timeout) && timeout > 0) {
+        config.timeout = timeout;
+        console.error(`Timeout set to ${timeout} seconds`);
+      } else {
+        console.error(`Invalid timeout value: ${args[i + 1]}. Using default.`);
+      }
+      i++; // Skip the next argument
+    } else if (args[i] === '--help' || args[i] === '-h') {
+      console.log(`
+Probe MCP Server
+
+Usage:
+  probe-mcp [options]
+
+Options:
+  --timeout, -t <seconds>  Set timeout for search operations (default: 30)
+  --help, -h              Show this help message
+`);
+      process.exit(0);
+    }
+  }
+  
+  return config;
+}
+
+const cliConfig = parseArgs();
+
 const execAsync = promisify(exec);
 
 // Get the package.json to determine the version
@@ -76,10 +111,13 @@ interface SearchCodeArgs {
   filesOnly?: boolean;
   ignore?: string[];
   excludeFilenames?: boolean;
+  exact?: boolean;
   maxResults?: number;
   maxTokens?: number;
   allowTests?: boolean;
   session?: string;
+  timeout?: number;
+  noGitignore?: boolean;
 }
 
 interface QueryCodeArgs {
@@ -90,6 +128,8 @@ interface QueryCodeArgs {
   allowTests?: boolean;
   maxResults?: number;
   format?: 'markdown' | 'plain' | 'json' | 'color';
+  timeout?: number;
+  noGitignore?: boolean;
 }
 
 interface ExtractCodeArgs {
@@ -98,12 +138,16 @@ interface ExtractCodeArgs {
   allowTests?: boolean;
   contextLines?: number;
   format?: 'markdown' | 'plain' | 'json';
+  timeout?: number;
+  noGitignore?: boolean;
 }
 
 class ProbeServer {
   private server: Server;
+  private defaultTimeout: number;
 
-  constructor() {
+  constructor(timeout: number = 30) {
+    this.defaultTimeout = timeout;
     this.server = new Server(
       {
         name: '@buger/probe-mcp',
@@ -158,6 +202,10 @@ class ProbeServer {
                 type: 'boolean',
                 description: 'Exclude filenames from being used for matching'
               },
+              exact: {
+                type: 'boolean',
+                description: 'Perform exact search without tokenization (case-insensitive)'
+              },
               allowTests: {
                 type: 'boolean',
                 description: 'Allow test files and test code blocks in results (disabled by default)'
@@ -166,9 +214,17 @@ class ProbeServer {
                 type: 'string',
                 description: 'Session identifier for caching. Set to "new" if unknown, or want to reset cache. Re-use session ID returned from previous searches',
                 default: "new",
+              },
+              timeout: {
+                type: 'number',
+                description: 'Timeout for the search operation in seconds (default: 30)',
+              },
+              noGitignore: {
+                type: 'boolean',
+                description: 'Skip .gitignore files (will use PROBE_NO_GITIGNORE environment variable if not set)',
               }
             },
-            required: ['query']
+            required: ['path', 'query']
           },
         },
         {
@@ -202,9 +258,17 @@ class ProbeServer {
                 type: 'string',
                 enum: ['markdown', 'plain', 'json', 'color'],
                 description: 'Output format for the query results'
+              },
+              timeout: {
+                type: 'number',
+                description: 'Timeout for the query operation in seconds (default: 30)',
+              },
+              noGitignore: {
+                type: 'boolean',
+                description: 'Skip .gitignore files (will use PROBE_NO_GITIGNORE environment variable if not set)',
               }
             },
-            required: ['pattern']
+            required: ['path', 'pattern']
           },
         },
         {
@@ -237,6 +301,14 @@ class ProbeServer {
                 description: 'Output format for the extracted code',
                 default: 'markdown'
               },
+              timeout: {
+                type: 'number',
+                description: 'Timeout for the extract operation in seconds (default: 30)',
+              },
+              noGitignore: {
+                type: 'boolean',
+                description: 'Skip .gitignore files (will use PROBE_NO_GITIGNORE environment variable if not set)',
+              }
             },
             required: ['path', 'files'],
           },
@@ -334,13 +406,26 @@ class ProbeServer {
       if (args.filesOnly !== undefined) options.filesOnly = args.filesOnly;
       if (args.ignore !== undefined) options.ignore = args.ignore;
       if (args.excludeFilenames !== undefined) options.excludeFilenames = args.excludeFilenames;
+      if (args.exact !== undefined) options.exact = args.exact;
       if (args.maxResults !== undefined) options.maxResults = args.maxResults;
       if (args.maxTokens !== undefined) options.maxTokens = args.maxTokens;
       if (args.allowTests !== undefined) options.allowTests = args.allowTests;
+      // Use noGitignore from args, or fall back to PROBE_NO_GITIGNORE environment variable
+      if (args.noGitignore !== undefined) {
+        options.noGitignore = args.noGitignore;
+      } else if (process.env.PROBE_NO_GITIGNORE) {
+        options.noGitignore = process.env.PROBE_NO_GITIGNORE === 'true';
+      }
       if (args.session !== undefined && args.session.trim() !== '') {
         options.session = args.session;
       } else {
         options.session = "new";
+      }
+      // Use timeout from args, or fall back to instance default
+      if (args.timeout !== undefined) {
+        options.timeout = args.timeout;
+      } else if (this.defaultTimeout !== undefined) {
+        options.timeout = this.defaultTimeout;
       }
       
       console.error("Executing search with options:", JSON.stringify(options, null, 2));
@@ -379,15 +464,23 @@ class ProbeServer {
       }
 
       // Create a single options object with both pattern and path
-      const options = {
+      const options: any = {
         path: args.path,
         pattern: args.pattern,
         language: args.language,
         ignore: args.ignore,
         allowTests: args.allowTests,
         maxResults: args.maxResults,
-        format: args.format
+        format: args.format,
+        timeout: args.timeout || this.defaultTimeout
       };
+      
+      // Use noGitignore from args, or fall back to PROBE_NO_GITIGNORE environment variable
+      if (args.noGitignore !== undefined) {
+        options.noGitignore = args.noGitignore;
+      } else if (process.env.PROBE_NO_GITIGNORE) {
+        options.noGitignore = process.env.PROBE_NO_GITIGNORE === 'true';
+      }
       
       console.log("Executing query with options:", JSON.stringify({
         path: options.path,
@@ -416,13 +509,21 @@ class ProbeServer {
       }
 
       // Create a single options object with files and other parameters
-      const options = {
+      const options: any = {
         files: args.files,
         path: args.path,
         allowTests: args.allowTests,
         contextLines: args.contextLines,
-        format: args.format
+        format: args.format,
+        timeout: args.timeout || this.defaultTimeout
       };
+      
+      // Use noGitignore from args, or fall back to PROBE_NO_GITIGNORE environment variable
+      if (args.noGitignore !== undefined) {
+        options.noGitignore = args.noGitignore;
+      } else if (process.env.PROBE_NO_GITIGNORE) {
+        options.noGitignore = process.env.PROBE_NO_GITIGNORE === 'true';
+      }
       
       // Call extract with the complete options object
       try {
@@ -489,5 +590,5 @@ class ProbeServer {
   }
 }
 
-const server = new ProbeServer();
+const server = new ProbeServer(cliConfig.timeout);
 server.run().catch(console.error);

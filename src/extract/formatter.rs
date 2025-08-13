@@ -3,9 +3,9 @@
 //! This module provides functions for formatting and printing extraction results
 //! in various formats (terminal, markdown, plain, json, xml, color).
 
-use crate::models::SearchResult;
-use crate::search::search_tokens::count_tokens;
 use anyhow::Result;
+use probe_code::models::SearchResult;
+use probe_code::search::search_tokens::sum_tokens_with_deduplication;
 use serde::Serialize;
 use std::fmt::Write as FmtWrite;
 use std::path::Path;
@@ -74,7 +74,8 @@ fn format_extraction_internal(
                     "results": json_results,
                     "summary": {
                         "count": results.len(),
-                    }
+                    },
+                    "version": probe_code::version::get_version()
                 });
 
                 // Add system prompt, user instructions, and original_input if provided
@@ -134,14 +135,20 @@ fn format_extraction_internal(
                     })
                     .collect();
 
+                // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for extract JSON output:
+                // Process all code blocks in batch to leverage content deduplication
+                let code_blocks: Vec<&str> = results.iter().map(|r| r.code.as_str()).collect();
+                let total_tokens = sum_tokens_with_deduplication(&code_blocks);
+
                 // Create a wrapper object with results and summary
                 let mut wrapper = serde_json::json!({
                     "results": json_results,
                     "summary": {
                         "count": results.len(),
                         "total_bytes": results.iter().map(|r| r.code.len()).sum::<usize>(),
-                        "total_tokens": results.iter().map(|r| count_tokens(&r.code)).sum::<usize>(),
-                    }
+                        "total_tokens": total_tokens,
+                    },
+                    "version": probe_code::version::get_version()
                 });
 
                 // Add system prompt, user instructions, and original_input if provided
@@ -198,6 +205,11 @@ fn format_extraction_internal(
                 writeln!(output, "  <summary>")?;
                 writeln!(output, "    <count>{}</count>", results.len())?;
                 writeln!(output, "  </summary>")?;
+                writeln!(
+                    output,
+                    "  <version>{}</version>",
+                    probe_code::version::get_version()
+                )?;
             } else {
                 // NON-DRY-RUN: includes code
                 for result in results {
@@ -229,36 +241,39 @@ fn format_extraction_internal(
                     "    <total_bytes>{}</total_bytes>",
                     results.iter().map(|r| r.code.len()).sum::<usize>()
                 )?;
+                // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for extract XML output:
+                // Process all code blocks in batch to leverage content deduplication
+                let code_blocks: Vec<&str> = results.iter().map(|r| r.code.as_str()).collect();
+                let total_tokens = sum_tokens_with_deduplication(&code_blocks);
+
+                writeln!(output, "    <total_tokens>{total_tokens}</total_tokens>")?;
+                writeln!(output, "  </summary>")?;
                 writeln!(
                     output,
-                    "    <total_tokens>{}</total_tokens>",
-                    results.iter().map(|r| count_tokens(&r.code)).sum::<usize>()
+                    "  <version>{}</version>",
+                    probe_code::version::get_version()
                 )?;
-                writeln!(output, "  </summary>")?;
             }
 
             // Add original_input, system_prompt, and user_instructions inside the root element
             if let Some(input) = original_input {
                 writeln!(
                     output,
-                    "  <original_input><![CDATA[{}]]></original_input>",
-                    input
+                    "  <original_input><![CDATA[{input}]]></original_input>"
                 )?;
             }
 
             if let Some(prompt) = system_prompt {
                 writeln!(
                     output,
-                    "  <system_prompt><![CDATA[{}]]></system_prompt>",
-                    prompt
+                    "  <system_prompt><![CDATA[{prompt}]]></system_prompt>"
                 )?;
             }
 
             if let Some(instructions) = user_instructions {
                 writeln!(
                     output,
-                    "  <user_instructions><![CDATA[{}]]></user_instructions>",
-                    instructions
+                    "  <user_instructions><![CDATA[{instructions}]]></user_instructions>"
                 )?;
             }
 
@@ -315,7 +330,7 @@ fn format_extraction_internal(
                         match format {
                             "markdown" => {
                                 if !language.is_empty() {
-                                    writeln!(output, "```{}", language)?;
+                                    writeln!(output, "```{language}")?;
                                 } else {
                                     writeln!(output, "```")?;
                                 }
@@ -331,7 +346,7 @@ fn format_extraction_internal(
                             }
                             "color" => {
                                 if !language.is_empty() {
-                                    writeln!(output, "```{}", language)?;
+                                    writeln!(output, "```{language}")?;
                                 } else {
                                     writeln!(output, "```")?;
                                 }
@@ -341,7 +356,7 @@ fn format_extraction_internal(
                             // "terminal" or anything else not covered
                             _ => {
                                 if !language.is_empty() {
-                                    writeln!(output, "```{}", language)?;
+                                    writeln!(output, "```{language}")?;
                                 } else {
                                     writeln!(output, "```")?;
                                 }
@@ -358,17 +373,17 @@ fn format_extraction_internal(
             // Now, print the root-level data (system prompt, user instructions, original input)
             if let Some(input) = original_input {
                 writeln!(output, "{}", "Original Input:".yellow().bold())?;
-                writeln!(output, "{}", input)?;
+                writeln!(output, "{input}")?;
             }
             if let Some(prompt) = system_prompt {
                 writeln!(output)?;
                 writeln!(output, "{}", "System Prompt:".yellow().bold())?;
-                writeln!(output, "{}", prompt)?;
+                writeln!(output, "{prompt}")?;
             }
             if let Some(instructions) = user_instructions {
                 writeln!(output)?;
                 writeln!(output, "{}", "User Instructions:".yellow().bold())?;
-                writeln!(output, "{}", instructions)?;
+                writeln!(output, "{instructions}")?;
             }
 
             // Summaries for non-JSON/XML:
@@ -400,9 +415,18 @@ fn format_extraction_internal(
                     )?;
 
                     let total_bytes: usize = results.iter().map(|r| r.code.len()).sum();
-                    let total_tokens: usize = results.iter().map(|r| count_tokens(&r.code)).sum();
-                    writeln!(output, "Total bytes returned: {}", total_bytes)?;
-                    writeln!(output, "Total tokens returned: {}", total_tokens)?;
+
+                    // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for extract terminal output:
+                    // Process all code blocks in batch to leverage content deduplication
+                    let code_blocks: Vec<&str> = results.iter().map(|r| r.code.as_str()).collect();
+                    let total_tokens: usize = sum_tokens_with_deduplication(&code_blocks);
+                    writeln!(output, "Total bytes returned: {total_bytes}")?;
+                    writeln!(output, "Total tokens returned: {total_tokens}")?;
+                    writeln!(
+                        output,
+                        "Probe version: {}",
+                        probe_code::version::get_version()
+                    )?;
                 }
             }
         }
@@ -484,7 +508,7 @@ pub fn format_and_print_extraction_results(
         system_prompt,
         user_instructions,
     )?;
-    println!("{}", output);
+    println!("{output}");
     Ok(())
 }
 
@@ -519,6 +543,7 @@ pub fn get_language_from_extension(extension: &str) -> &'static str {
         "sql" => "sql",
         "kt" | "kts" => "kotlin",
         "swift" => "swift",
+        "cs" => "csharp",
         "scala" => "scala",
         "dart" => "dart",
         "ex" | "exs" => "elixir",

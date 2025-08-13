@@ -3,10 +3,10 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use probe::search::elastic_query::parse_query_test as parse_query;
-use probe::search::file_processing::filter_code_block_with_ast;
-use probe::search::query::create_query_plan;
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::elastic_query::parse_query_test as parse_query;
+use probe_code::search::file_processing::filter_code_block_with_ast;
+use probe_code::search::query::create_query_plan;
+use probe_code::search::{perform_probe, SearchOptions};
 
 /// Test stemming and compound word handling in block filtering with complex queries
 #[test]
@@ -99,7 +99,9 @@ fn test_stemming_with_and_query(temp_path: &Path) {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -179,7 +181,9 @@ fn test_stemming_with_or_query(temp_path: &Path) {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -261,7 +265,7 @@ fn test_stemming_with_complex_query(_temp_path: &Path) {
     // Parse the query into an AST
     // Using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();
@@ -381,7 +385,9 @@ fn test_compound_word_splitting(temp_path: &Path) {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -426,7 +432,9 @@ fn test_compound_word_splitting(temp_path: &Path) {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -483,7 +491,9 @@ fn test_negative_compound_word_in_existing_tests(temp_path: &Path) {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search

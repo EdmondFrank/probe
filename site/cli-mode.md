@@ -257,32 +257,123 @@ probe-chat [PATH] [OPTIONS]
 | `--max-iterations <number>` | Max tool iterations allowed (default: 30) |
 | `--prompt <value>` | Use a custom prompt (`architect`, `code-review`, `support`, `engineer`, path to file, or string) |
 | `--allow-edit` | **Enable code editing via the `implement` tool (uses Aider)** |
+| `--trace-file [path]` | Enable file-based tracing (default: ./probe-traces.jsonl) |
+| `--trace-remote <url>` | Enable remote tracing to OpenTelemetry collector |
+| `--trace-console` | Enable console tracing for debugging |
 
-### Enabling Code Editing (`--allow-edit`)
+### Code Editing (`--allow-edit`)
 
-Using the `--allow-edit` flag enables the AI agent's `implement` tool, which allows it to modify your codebase.
+The `--allow-edit` flag lets Probe make changes to your code files.
 
-*   **Functionality**: When enabled, the agent can use the `implement` tool in response to requests like "Refactor this function" or "Add error handling here". This tool uses **Aider** (an external command-line AI coding assistant) to apply the requested changes to your files.
-*   **Requirements**:
-    *   **Aider Installation**: You must install Aider for the `implement` tool to function. Visit the [Aider project website](https://aider.chat/) for full details. A common installation method is:
-        ```bash
-        # Install the aider installer
-        python -m pip install -U aider-chat
+#### How It Works
 
-        # Run the installer (optional, installs aider command globally)
-        # aider-install
-        ```
-        Ensure the `aider` command is available in your system's PATH.
-    *   **Permissions**: The `probe-chat` process needs write permissions to the files and directories it intends to modify.
-*   **Security**: Enabling code editing by an AI carries risks. Always review changes made by Aider carefully before committing them. Ensure the AI understands the context and your intent correctly.
-*   **Usage**:
-    ```bash
-    # Start an interactive chat session with editing enabled
-    probe-chat --allow-edit
+When you enable editing, Probe can modify your code when you ask it to:
+- "Fix this bug in main.py"
+- "Add error handling to this function"
+- "Refactor this code to be cleaner"
 
-    # Send a single message requesting a change (non-interactive)
-    probe-chat --allow-edit --message "Add comments to the process_data function in utils.py"
-    ```
+#### What You Need
+
+1. **Install a Backend Tool**: Probe can use different tools to make code changes:
+   
+   - **Claude Code** (default if available):
+     ```bash
+     npm install -g @anthropic-ai/claude-code
+     ```
+   
+   - **Aider** (fallback):
+     ```bash
+     pip install aider-chat
+     ```
+
+2. **File Permissions**: Make sure Probe can write to your project files.
+
+#### Backend Configuration
+
+Probe automatically detects which tool to use for code editing:
+1. **Claude Code**: Used by default if installed (cross-platform, including WSL on Windows)
+2. **Aider**: Used as fallback if Claude Code is not available
+
+You can override this behavior by setting the `implement_tool_backend` environment variable:
+```bash
+# Force using Claude Code
+export implement_tool_backend=claude
+probe-chat --allow-edit
+
+# Force using Aider
+export implement_tool_backend=aider
+probe-chat --allow-edit
+```
+
+#### Usage Examples
+
+```bash
+# Start chat with editing enabled
+probe-chat --allow-edit
+
+# Ask for a specific change
+probe-chat --allow-edit --message "Add comments to the main function"
+```
+
+#### Important Safety Notes
+
+- **Always review changes** before keeping them
+- **Test your code** after Probe makes changes
+- **Start small** - try simple changes first to see how it works
+
+#### GitHub Actions Alternative
+
+If you're using Probe in GitHub Actions, you can use `allow_suggestions` instead, which creates reviewable suggestions rather than direct changes. See the [GitHub Actions Integration](./integrations/github-actions.md#code-modification-options) guide for details.
+
+### OpenTelemetry Tracing
+
+The `--trace-file`, `--trace-remote`, and `--trace-console` flags enable comprehensive monitoring and observability for AI interactions.
+
+#### Tracing Options
+
+**File Tracing (`--trace-file`)**
+- Saves traces to a JSON Lines format file for offline analysis
+- Default file path: `./probe-traces.jsonl`
+- Custom path: `--trace-file ./my-traces.jsonl`
+
+**Remote Tracing (`--trace-remote`)**
+- Sends traces to OpenTelemetry collectors (Jaeger, Zipkin, etc.)
+- Requires collector URL: `--trace-remote http://localhost:4318/v1/traces`
+
+**Console Tracing (`--trace-console`)**
+- Outputs traces to console for debugging
+- Useful for development and troubleshooting
+
+#### Usage Examples
+
+```bash
+# Enable file-based tracing
+probe-chat --trace-file
+
+# Enable remote tracing to Jaeger
+probe-chat --trace-remote http://localhost:4318/v1/traces
+
+# Enable console tracing for debugging
+probe-chat --trace-console
+
+# Combine multiple tracing options
+probe-chat --trace-file --trace-remote --trace-console
+
+# Use custom file path
+probe-chat --trace-file ./debug-traces.jsonl
+```
+
+#### What Gets Traced
+
+The tracing system captures detailed information about AI interactions:
+
+- **Performance Metrics**: Response times, request durations, and throughput
+- **Token Usage**: Prompt tokens, completion tokens, and total consumption
+- **Model Information**: Provider, model name, and configuration
+- **Session Data**: Session IDs, iteration counts, and conversation flow
+- **Error Tracking**: Failed requests, timeouts, and error details
+
+For more details on tracing, see the [AI Chat documentation](./ai-chat.md#opentelemetry-tracing).
 
 ### Chat Examples
 
@@ -301,4 +392,10 @@ probe-chat --message "Explain the auth flow in main.go" --json
 
 # Start chat with editing enabled (requires Aider)
 probe-chat /path/to/project --allow-edit
+
+# Start chat with tracing enabled
+probe-chat --trace-file ./session-traces.jsonl
+
+# Start chat with full observability
+probe-chat --trace-file --trace-remote http://localhost:4318/v1/traces --allow-edit
 ```

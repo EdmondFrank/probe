@@ -8,6 +8,9 @@ import { TokenCounter } from './tokenCounter.js';
 import { TokenUsageDisplay } from './tokenUsageDisplay.js';
 import { writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { TelemetryConfig } from './telemetry.js';
+import { trace } from '@opentelemetry/api';
+import { appTracer } from './appTracer.js';
 // Import the tools that emit events and the listFilesByLevel utility
 import { listFilesByLevel } from '@buger/probe';
 // Import schemas and parser from common (assuming tools.js)
@@ -59,6 +62,169 @@ if (typeof process !== 'undefined' && !process.env.PROBE_CHAT_SKIP_FOLDER_VALIDA
 
 
 /**
+ * Extract image URLs from message text
+ * @param {string} message - The message text to analyze
+ * @param {boolean} debug - Whether to log debug information
+ * @returns {Array} Array of { url: string, cleanedMessage: string }
+ */
+function extractImageUrls(message, debug = false) {
+  // This function should be called within the session context, so it will inherit the trace ID
+  const tracer = trace.getTracer('probe-chat', '1.0.0');
+  return tracer.startActiveSpan('content.image.extract', (span) => {
+    try {
+      // Pattern to match image URLs and base64 data:
+      // 1. GitHub private-user-images URLs (always images, regardless of extension)
+      // 2. GitHub user-attachments/assets URLs (always images, regardless of extension)
+      // 3. URLs with common image extensions (PNG, JPG, JPEG, WebP, GIF)
+      // 4. Base64 data URLs (data:image/...)
+      // Updated to stop at quotes, spaces, or common HTML/XML delimiters
+      const imageUrlPattern = /(?:data:image\/[a-zA-Z]*;base64,[A-Za-z0-9+/=]+|https?:\/\/(?:(?:private-user-images\.githubusercontent\.com|github\.com\/user-attachments\/assets)\/[^\s"'<>]+|[^\s"'<>]+\.(?:png|jpg|jpeg|webp|gif)(?:\?[^\s"'<>]*)?))/gi;
+      
+      span.setAttributes({
+        'message.length': message.length,
+        'debug.enabled': debug
+      });
+      
+      if (debug) {
+        console.log(`[DEBUG] Scanning message for image URLs. Message length: ${message.length}`);
+        console.log(`[DEBUG] Image URL pattern: ${imageUrlPattern.toString()}`);
+      }
+      
+      const urls = [];
+      let match;
+      
+      while ((match = imageUrlPattern.exec(message)) !== null) {
+        urls.push(match[0]);
+        if (debug) {
+          console.log(`[DEBUG] Found image URL: ${match[0]}`);
+        }
+      }
+      
+      // Remove image URLs from message text
+      const cleanedMessage = message.replace(imageUrlPattern, '').trim();
+      
+      span.setAttributes({
+        'images.found': urls.length,
+        'message.cleaned_length': cleanedMessage.length
+      });
+      
+      if (debug) {
+        console.log(`[DEBUG] Total image URLs found: ${urls.length}`);
+        if (urls.length > 0) {
+          console.log(`[DEBUG] Original message length: ${message.length}, cleaned message length: ${cleanedMessage.length}`);
+        }
+      }
+      
+      const result = {
+        imageUrls: urls,
+        cleanedMessage: cleanedMessage
+      };
+      
+      span.setStatus({ code: 1 }); // SUCCESS
+      return result;
+    } catch (error) {
+      span.recordException(error);
+      span.setStatus({ code: 2, message: error.message }); // ERROR
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/**
+ * Validate image URLs by checking if they're accessible, handling redirects
+ * @param {string[]} imageUrls - Array of image URLs to validate
+ * @param {boolean} debug - Whether to log debug messages
+ * @returns {Promise<string[]>} Array of valid final image URLs (after redirects)
+ */
+async function validateImageUrls(imageUrls, debug = false) {
+  const validUrls = [];
+  
+  for (const url of imageUrls) {
+    try {
+      // Check if it's a base64 data URL
+      if (url.startsWith('data:image/')) {
+        // Validate base64 data URL format
+        const dataUrlMatch = url.match(/^data:image\/([a-zA-Z]*);base64,([A-Za-z0-9+/=]+)$/);
+        if (dataUrlMatch) {
+          const [, imageType, base64Data] = dataUrlMatch;
+          
+          // Basic validation of base64 data
+          if (base64Data.length > 0 && imageType) {
+            // Estimate file size from base64 (rough approximation: base64 is ~1.33x original size)
+            const estimatedSize = (base64Data.length * 3) / 4;
+            
+            // Check size limit (10MB)
+            if (estimatedSize <= 10 * 1024 * 1024) {
+              validUrls.push(url);
+              if (debug) {
+                console.log(`[DEBUG] Valid base64 image: ${imageType} (~${(estimatedSize / 1024).toFixed(1)}KB)`);
+              }
+            } else {
+              if (debug) {
+                console.log(`[DEBUG] Base64 image too large: ~${(estimatedSize / 1024 / 1024).toFixed(1)}MB (max 10MB)`);
+              }
+            }
+          } else {
+            if (debug) {
+              console.log(`[DEBUG] Invalid base64 data URL format: ${url.substring(0, 50)}...`);
+            }
+          }
+        } else {
+          if (debug) {
+            console.log(`[DEBUG] Invalid data URL format: ${url.substring(0, 50)}...`);
+          }
+        }
+      } else {
+        // Handle regular HTTP/HTTPS URLs
+        // Always use GET request with Range header to validate and get content type
+        // This works better than HEAD for GitHub URLs and other services
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Range': 'bytes=0-1023' // Only fetch first 1KB to check content type and minimize data transfer
+          },
+          timeout: 10000, // TIMEOUTS.HTTP_REQUEST - 10 second timeout for GitHub URLs which can be slower
+          redirect: 'follow'
+        });
+        
+        if (response.ok || response.status === 206) { // 206 = Partial Content (from Range header)
+          // Check if the response has image content type
+          const contentType = response.headers.get('content-type');
+          if (contentType && contentType.startsWith('image/')) {
+            // Use the final URL after following redirects
+            const finalUrl = response.url;
+            validUrls.push(finalUrl);
+            if (debug) {
+              if (finalUrl !== url) {
+                console.log(`[DEBUG] Valid image URL after redirect: ${url} -> ${finalUrl} (${contentType})`);
+              } else {
+                console.log(`[DEBUG] Valid image URL: ${finalUrl} (${contentType})`);
+              }
+            }
+          } else {
+            if (debug) {
+              console.log(`[DEBUG] URL not an image: ${url} (${contentType || 'unknown type'})`);
+            }
+          }
+        } else {
+          if (debug) {
+            console.log(`[DEBUG] URL not accessible: ${url} (status: ${response.status})`);
+          }
+        }
+      }
+    } catch (error) {
+      if (debug) {
+        console.log(`[DEBUG] Error validating image URL ${url}: ${error.message}`);
+      }
+    }
+  }
+  
+  return validUrls;
+}
+
+/**
  * ProbeChat class to handle chat interactions with AI models
  */
 export class ProbeChat {
@@ -87,8 +253,10 @@ export class ProbeChat {
     this.customPrompt = options.customPrompt || process.env.CUSTOM_PROMPT || null;
     this.promptType = options.promptType || process.env.PROMPT_TYPE || null;
 
-    // Store allowEdit flag
-    this.allowEdit = !!options.allowEdit || process.env.ALLOW_EDIT === '1';
+    // Store allowEdit flag - enable if allow_edit is set or if allow_suggestions is set via environment
+    // Note: ALLOW_SUGGESTIONS also enables allowEdit because the implement tool is needed to generate
+    // code changes that reviewdog can then convert into PR review suggestions
+    this.allowEdit = !!options.allowEdit || process.env.ALLOW_EDIT === '1' || process.env.ALLOW_SUGGESTIONS === '1';
 
     // Store client-provided API credentials if available
     this.clientApiProvider = options.apiProvider;
@@ -132,8 +300,17 @@ export class ProbeChat {
     // Initialize the chat model
     this.initializeModel();
 
+    // Initialize telemetry
+    this.initializeTelemetry();
+
     // Initialize chat history
     this.history = [];
+    
+    // Initialize display history - tracks what users actually see
+    this.displayHistory = [];
+    
+    // Store persistent storage instance if provided
+    this.storage = options.storage || null;
   }
 
   /**
@@ -282,6 +459,41 @@ export class ProbeChat {
   }
 
   /**
+   * Initialize telemetry configuration
+   */
+  initializeTelemetry() {
+    try {
+      // Check if telemetry is enabled via environment variables
+      const fileEnabled = process.env.OTEL_ENABLE_FILE === 'true';
+      const remoteEnabled = process.env.OTEL_ENABLE_REMOTE === 'true';
+      const consoleEnabled = process.env.OTEL_ENABLE_CONSOLE === 'true';
+      
+      if (fileEnabled || remoteEnabled || consoleEnabled) {
+        this.telemetryConfig = new TelemetryConfig({
+          enableFile: fileEnabled,
+          enableRemote: remoteEnabled,
+          enableConsole: consoleEnabled,
+          filePath: process.env.OTEL_FILE_PATH || './traces.jsonl',
+          remoteEndpoint: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || 'http://localhost:4318/v1/traces'
+        });
+        
+        this.telemetryConfig.initialize();
+        
+        if (this.debug) {
+          console.log('[DEBUG] Telemetry initialized successfully');
+        }
+      } else {
+        if (this.debug) {
+          console.log('[DEBUG] Telemetry disabled - no exporters configured');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to initialize telemetry:', error.message);
+      this.telemetryConfig = null;
+    }
+  }
+
+  /**
     * Get the system message with instructions for the AI (XML Tool Format)
     * @returns {Promise<string>} - The system message
     */
@@ -401,7 +613,17 @@ When reviewing code:
 - Evaluate code style and consistency
 - Is the backward compatibility can be broken?
 - Organize feedback by severity (critical, major, minor) and type (bug, performance, security, style)
-- Provide specific, actionable suggestions with code examples where appropriate`,
+- Provide specific, actionable suggestions with code examples where appropriate
+
+## Failure Detection
+
+If you detect critical issues that should prevent the code from being merged, include <fail> in your response:
+- Security vulnerabilities that could be exploited
+- Breaking changes without proper documentation or migration path
+- Critical bugs that would cause system failures
+- Severe violations of project standards that must be addressed
+
+The <fail> tag will cause the GitHub check to fail, drawing immediate attention to these critical issues.`,
 
       'engineer': `You are senior engineer focused on software architecture and design.
 Before jumping on the task you first, in details analyse user request, and try to provide elegant and concise solution.
@@ -463,6 +685,9 @@ When troubleshooting:
 
     // Add Tool Definitions
     systemMessage += `\n# Tools Available\n${toolDefinitions}\n`;
+
+    // Add special emphasis for image handling
+    systemMessage += `\n# CRITICAL: XML Tool Format Required\n\nEven when processing images or visual content, you MUST respond using the XML tool format. Do not provide direct answers about images - instead use the appropriate tool (usually <attempt_completion>) with your analysis inside the <result> tag.\n\nExample when analyzing an image:\n<attempt_completion>\n<result>\nI can see this is a promotional image from Tyk showing... [your analysis here]\n</result>\n</attempt_completion>\n`;
 
 
     const searchDirectory = this.allowedFolders.length > 0 ? this.allowedFolders[0] : process.cwd();
@@ -560,60 +785,132 @@ When troubleshooting:
    * Process a user message and get a response
    * @param {string} message - The user message
    * @param {string} [sessionId] - Optional session ID to use for this chat (overrides the default)
+   * @param {Object} [apiCredentials] - Optional API credentials for this call
+   * @param {string[]} [images] - Optional array of base64 image URLs
    * @returns {Promise<string>} - The AI response
    */
-  async chat(message, sessionId, apiCredentials = null) {
-    // Update client credentials if provided in this call
-    if (apiCredentials) {
-      this.clientApiProvider = apiCredentials.apiProvider || this.clientApiProvider;
-      this.clientApiKey = apiCredentials.apiKey || this.clientApiKey;
-      this.clientApiUrl = apiCredentials.apiUrl || this.clientApiUrl;
+  async chat(message, sessionId, apiCredentials = null, images = []) {
+    // Use our custom app tracer for granular tracing
+    const effectiveSessionId = sessionId || this.sessionId;
+    
+    // Start the chat session span first, then execute the entire chat flow within the session context
+    const chatSessionSpan = appTracer.startChatSession(effectiveSessionId, message, this.apiType, this.model);
+    
+    // Execute the entire chat flow within the session context
+    return await appTracer.withSessionContext(effectiveSessionId, async () => {
+    
+    try {
 
-      // Re-initialize the model with the new credentials
-      if (apiCredentials.apiKey && apiCredentials.apiProvider) {
-        this.initializeModel();
+        // Update client credentials if provided in this call
+        if (apiCredentials) {
+          this.clientApiProvider = apiCredentials.apiProvider || this.clientApiProvider;
+          this.clientApiKey = apiCredentials.apiKey || this.clientApiKey;
+          this.clientApiUrl = apiCredentials.apiUrl || this.clientApiUrl;
+
+          // Re-initialize the model with the new credentials
+          if (apiCredentials.apiKey && apiCredentials.apiProvider) {
+            this.initializeModel();
+          }
+        }
+
+        // Handle no API keys mode gracefully
+        if (this.noApiKeysMode) {
+          console.error("Cannot process chat: No API keys configured.");
+          appTracer.endChatSession(effectiveSessionId, false, 0);
+          // Return structured response even for API key errors
+          return {
+            response: "Error: ProbeChat is not configured with an AI provider API key. Please set the appropriate environment variable (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY) or provide an API key in the browser.",
+            tokenUsage: { contextWindow: 0, current: {}, total: {} }
+          };
+        }
+
+        // Reset cancelled flag for the new request
+        this.cancelled = false;
+
+        // Create a new AbortController for this specific request
+        // This ensures previous cancellations don't affect new requests
+        this.abortController = new AbortController();
+
+        // If a session ID is provided and it's different from the current one, update it
+        if (sessionId && sessionId !== this.sessionId) {
+          if (this.debug) {
+            console.log(`[DEBUG] Switching session ID from ${this.sessionId} to ${sessionId}`);
+          }
+          // Update the session ID for this instance
+          this.sessionId = sessionId;
+          // NOTE: History is NOT cleared automatically when session ID changes this way.
+          // Call clearHistory() explicitly if a new session should start fresh.
+        }
+
+        // Process the message using the potentially updated session ID
+        const result = await this._processChat(message, effectiveSessionId, images);
+        
+        appTracer.endChatSession(effectiveSessionId, true, result.tokenUsage?.total?.total || 0);
+        
+        // CRITICAL FIX: Ensure all spans are properly exported before returning
+        if (this.telemetryConfig) {
+          try {
+            // First, ensure the session span is ended within its context
+            await appTracer.withSessionContext(effectiveSessionId, async () => {
+              // Small delay to ensure all child spans are ended
+              await new Promise(resolve => setTimeout(resolve, 50));
+            });
+            
+            // Give BatchSpanProcessor time to process the ended spans
+            // BatchSpanProcessor has a scheduledDelayMillis of 500ms (reduced from default 5000ms)
+            await new Promise(resolve => setTimeout(resolve, 600));
+            
+            // Force flush all pending spans
+            await this.telemetryConfig.forceFlush();
+            
+            // Additional delay to ensure file writes complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } catch (flushError) {
+            if (this.debug) console.log('[DEBUG] Telemetry flush warning:', flushError.message);
+          }
+        }
+        
+        return result;
+      } catch (error) {
+        appTracer.endChatSession(effectiveSessionId, false, 0);
+        
+        // CRITICAL FIX: Ensure all spans are properly exported even on error
+        if (this.telemetryConfig) {
+          try {
+            // First, ensure the session span is ended within its context
+            await appTracer.withSessionContext(effectiveSessionId, async () => {
+              // Small delay to ensure all child spans are ended
+              await new Promise(resolve => setTimeout(resolve, 50));
+            });
+            
+            // Give BatchSpanProcessor time to process the ended spans
+            // BatchSpanProcessor has a scheduledDelayMillis of 500ms (reduced from default 5000ms)
+            await new Promise(resolve => setTimeout(resolve, 600));
+            
+            // Force flush all pending spans
+            await this.telemetryConfig.forceFlush();
+            
+            // Additional delay to ensure file writes complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } catch (flushError) {
+            if (this.debug) console.log('[DEBUG] Telemetry flush warning:', flushError.message);
+          }
+        }
+        
+        throw error;
       }
-    }
-
-    // Handle no API keys mode gracefully
-    if (this.noApiKeysMode) {
-      console.error("Cannot process chat: No API keys configured.");
-      // Return structured response even for API key errors
-      return {
-        response: "Error: ProbeChat is not configured with an AI provider API key. Please set the appropriate environment variable (e.g., ANTHROPIC_API_KEY, OPENAI_API_KEY) or provide an API key in the browser.",
-        tokenUsage: { contextWindow: 0, current: {}, total: {} }
-      };
-    }
-
-    // Reset cancelled flag for the new request
-    this.cancelled = false;
-
-    // Create a new AbortController for this specific request
-    // This ensures previous cancellations don't affect new requests
-    this.abortController = new AbortController();
-
-    // If a session ID is provided and it's different from the current one, update it
-    if (sessionId && sessionId !== this.sessionId) {
-      if (this.debug) {
-        console.log(`[DEBUG] Switching session ID from ${this.sessionId} to ${sessionId}`);
-      }
-      // Update the session ID for this instance
-      this.sessionId = sessionId;
-      // NOTE: History is NOT cleared automatically when session ID changes this way.
-      // Call clearHistory() explicitly if a new session should start fresh.
-    }
-
-    // Process the message using the potentially updated session ID
-    return await this._processChat(message);
+    }); // End withSessionContext
   }
 
   /**
    * Internal method to process a chat message using the XML tool loop
    * @param {string} message - The user message
+   * @param {string} sessionId - The session ID for tracing
+   * @param {string[]} images - Array of base64 image URLs
    * @returns {Promise<string>} - The final AI response after loop completion
    * @private
    */
-  async _processChat(message) {
+  async _processChat(message, sessionId, images = []) {
     let currentIteration = 0;
     let completionAttempted = false;
     let finalResult = `Error: Max tool iterations (${MAX_TOOL_ITERATIONS}) reached without completion. You can increase this limit using the MAX_TOOL_ITERATIONS environment variable or --max-iterations flag.`; // Default error
@@ -638,23 +935,168 @@ When troubleshooting:
       }
 
       const isFirstMessage = this.history.length === 0;
-      const wrappedMessage = isFirstMessage ? `<task>\n${message}\n</task>` : message;
+      
+      // Start user message processing trace
+      const messageId = `msg_${Date.now()}`;
+      appTracer.startUserMessageProcessing(sessionId, messageId, message);
+      
+      // Extract image URLs from the message within the processing context
+      const { imageUrls, cleanedMessage } = appTracer.withUserProcessingContext(sessionId, () => 
+        extractImageUrls(message, this.debug)
+      );
+      
+      // Start image processing trace if images are found
+      if (imageUrls.length > 0) {
+        appTracer.startImageProcessing(sessionId, messageId, imageUrls, cleanedMessage.length);
+        if (this.debug) console.log(`[DEBUG] Found ${imageUrls.length} image URLs in message`);
+      }
+      
+      // Log image detection only in interactive mode or debug mode
+      if (imageUrls.length > 0) {
+        if (process.env.PROBE_NON_INTERACTIVE !== '1' || process.env.DEBUG_CHAT === '1') {
+          console.log(`Detected ${imageUrls.length} image URL(s) in message.`);
+        }
+        if (this.debug) {
+          console.log(`[DEBUG] Extracted image URLs:`, imageUrls);
+        }
+      }
+      
+      // Validate image URLs and filter out broken ones
+      let validImageUrls = [];
+      let validationResults = null;
+      
+      if (imageUrls.length > 0) {
+        const validationStartTime = Date.now();
+        validImageUrls = await validateImageUrls(imageUrls, this.debug);
+        const validationEndTime = Date.now();
+        
+        // Record validation results in trace
+        validationResults = {
+          totalUrls: imageUrls.length,
+          validUrls: validImageUrls.length,
+          invalidUrls: imageUrls.length - validImageUrls.length,
+          redirectedUrls: 0, // TODO: capture from validateImageUrls if needed
+          timeoutUrls: 0, // TODO: capture from validateImageUrls if needed  
+          networkErrors: 0, // TODO: capture from validateImageUrls if needed
+          durationMs: validationEndTime - validationStartTime
+        };
+        
+        appTracer.recordImageValidation(sessionId, validationResults);
+        appTracer.endImageProcessing(sessionId, validImageUrls.length > 0, validImageUrls.length);
+      } else {
+        validImageUrls = await validateImageUrls(imageUrls, this.debug);
+      }
+      
+      // Start the agent loop trace within user processing context
+      appTracer.withUserProcessingContext(sessionId, () => {
+        appTracer.startAgentLoop(sessionId, MAX_TOOL_ITERATIONS);
+      });
+      
+      // Log validation results only in interactive mode or debug mode
+      if (imageUrls.length > 0) {
+        const invalidCount = imageUrls.length - validImageUrls.length;
+        if (process.env.PROBE_NON_INTERACTIVE !== '1' || process.env.DEBUG_CHAT === '1') {
+          if (validImageUrls.length > 0) {
+            console.log(`Image validation: ${validImageUrls.length} valid, ${invalidCount} invalid/inaccessible.`);
+          } else {
+            console.log(`Image validation: All ${imageUrls.length} image URLs failed validation.`);
+          }
+        }
+        
+        if (this.debug && validImageUrls.length > 0) {
+          console.log(`[DEBUG] Valid image URLs:`, validImageUrls);
+        }
+      }
+      
+      const wrappedMessage = isFirstMessage ? `<task>\n${cleanedMessage}\n</task>` : cleanedMessage;
+
+      // Combine extracted URL images with uploaded base64 images
+      const allImages = [...validImageUrls, ...images];
+      
+      // Create the user message with potential image attachments
+      const userMessage = { role: 'user', content: wrappedMessage };
+      
+      // Store user message in display history (always visible to users)
+      const displayUserMessage = { 
+        role: 'user', 
+        content: message, // Store original unwrapped message
+        visible: true, 
+        displayType: 'user',
+        timestamp: new Date().toISOString()
+      };
+      
+      // Add image attachments if any images are present
+      if (allImages.length > 0) {
+        userMessage.content = [
+          { type: 'text', text: wrappedMessage },
+          ...allImages.map(imageUrl => ({
+            type: 'image',
+            image: imageUrl
+          }))
+        ];
+        
+        // Add images to display message as well
+        displayUserMessage.images = allImages;
+        
+        if (this.debug) {
+          console.log(`[DEBUG] Created message with ${allImages.length} images (${validImageUrls.length} from URLs, ${images.length} uploaded)`);
+        }
+      }
+      
+      // Add user message to display history
+      if (!this.displayHistory) {
+        this.displayHistory = [];
+      }
+      this.displayHistory.push(displayUserMessage);
+      
+      // Save user message to persistent storage
+      if (this.storage) {
+        this.storage.saveMessage(this.sessionId, {
+          role: 'user',
+          content: message, // Original message
+          timestamp: Date.now(),
+          displayType: 'user',
+          visible: 1,
+          images: allImages,
+          metadata: {}
+        }).catch(err => {
+          console.error('Failed to save user message to persistent storage:', err);
+        });
+      }
 
       let currentMessages = [
         ...this.history,
-        { role: 'user', content: wrappedMessage }
+        userMessage
       ];
 
+      const promptGenerationStart = Date.now();
       const systemPrompt = await this.getSystemMessage();
+      const promptGenerationEnd = Date.now();
+      
       if (this.debug) {
         const systemTokens = this.tokenCounter.countTokens(systemPrompt);
         this.tokenCounter.addRequestTokens(systemTokens);
         console.log(`[DEBUG] System prompt estimated tokens: ${systemTokens}`);
+        
+        // Record system prompt generation metrics
+        appTracer.recordSystemPromptGeneration(sessionId, {
+          baseLength: 11747, // Approximate base system message length
+          finalLength: systemPrompt.length,
+          filesAdded: this.history.length > 0 ? 35 : 36, // Approximate from logs
+          generationDurationMs: promptGenerationEnd - promptGenerationStart,
+          promptType: this.promptType || 'default',
+          estimatedTokens: systemTokens
+        });
       }
 
       while (currentIteration < MAX_TOOL_ITERATIONS && !completionAttempted) {
         currentIteration++;
         if (this.cancelled) throw new Error('Request was cancelled by the user');
+
+        // Start iteration trace within agent loop context
+        appTracer.withAgentLoopContext(sessionId, () => {
+          appTracer.startAgentIteration(sessionId, currentIteration, currentMessages.length, this.tokenCounter.contextSize || 0);
+        });
 
         if (this.debug) {
           console.log(`\n[DEBUG] --- Tool Loop Iteration ${currentIteration}/${MAX_TOOL_ITERATIONS} ---`);
@@ -695,10 +1137,16 @@ When troubleshooting:
                 ...message,
                 content: typeof message.content === 'string'
                   ? [{ type: "text", text: message.content, providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } } }]
-                  : message.content.map(content => ({
-                    ...content,
-                    providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
-                  }))
+                  : message.content.map((content, contentIndex) => {
+                    // Only apply cache_control to the text part, not images
+                    if (content.type === 'text' && contentIndex === 0) {
+                      return {
+                        ...content,
+                        providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
+                      };
+                    }
+                    return content;
+                  })
               };
             }
             return message;
@@ -724,11 +1172,34 @@ When troubleshooting:
                 include_usage: true
               }
             }
+          },
+          experimental_telemetry: {
+            isEnabled: false, // Disable built-in telemetry in favor of our custom tracing
+            functionId: this.sessionId,
+            metadata: {
+              sessionId: this.sessionId,
+              iteration: currentIteration,
+              model: this.model,
+              apiType: this.apiType,
+              allowEdit: this.allowEdit,
+              promptType: this.promptType || 'default'
+            }
           }
         };
 
+        // Start AI generation request trace within iteration context
+        const aiRequestSpan = appTracer.withIterationContext(sessionId, currentIteration, () => {
+          return appTracer.startAiGenerationRequest(sessionId, currentIteration, this.model, this.apiType, {
+          temperature: 0.3,
+          maxTokens: maxResponseTokens,
+          maxRetries: 2
+          });
+        });
+
         // **Streaming Response Handling**
         let assistantResponseContent = '';
+        let startTime = Date.now();
+        let firstChunkTime = null;
         try {
           if (this.debug) console.log(`[DEBUG] Calling streamText with model ${this.model}...`);
 
@@ -739,6 +1210,9 @@ When troubleshooting:
           const { textStream } = streamText(generateOptions);
           for await (const chunk of textStream) {
             if (this.cancelled) throw new Error('Request was cancelled by the user');
+            if (firstChunkTime === null) {
+              firstChunkTime = Date.now();
+            }
             assistantResponseContent += chunk;
           }
 
@@ -758,10 +1232,55 @@ When troubleshooting:
           this.tokenCounter.calculateContextSize(currentMessages);
           if (this.debug) console.log(`[DEBUG] Context size AFTER LLM response (Iter ${currentIteration}): ${this.tokenCounter.contextSize}`);
 
+          // Record AI response in trace
+          const endTime = Date.now();
+          appTracer.recordAiResponse(sessionId, currentIteration, {
+            response: assistantResponseContent, // Include actual response content
+            responseLength: assistantResponseContent.length,
+            completionTokens: responseTokenCount,
+            promptTokens: this.tokenCounter.contextSize || 0,
+            finishReason: 'stop',
+            timeToFirstChunk: firstChunkTime ? (firstChunkTime - startTime) : 0,
+            timeToFinish: endTime - startTime
+          });
+
+          appTracer.endAiRequest(sessionId, currentIteration, true);
+
         } catch (error) {
+          // Classify and record the AI model error
+          let errorCategory = 'unknown';
+          if (this.cancelled || error.name === 'AbortError' || (error.message && error.message.includes('cancelled'))) {
+            errorCategory = 'cancellation';
+          } else if (error.message?.includes('timeout')) {
+            errorCategory = 'timeout';
+          } else if (error.message?.includes('rate limit') || error.message?.includes('quota')) {
+            errorCategory = 'api_limit';
+          } else if (error.message?.includes('network') || error.message?.includes('fetch')) {
+            errorCategory = 'network';
+          } else if (error.status >= 400 && error.status < 500) {
+            errorCategory = 'client_error';
+          } else if (error.status >= 500) {
+            errorCategory = 'server_error';
+          }
+          
+          appTracer.recordAiModelError(sessionId, currentIteration, {
+            category: errorCategory,
+            message: error.message,
+            model: this.model,
+            provider: this.apiType,
+            statusCode: error.status || 0,
+            retryAttempt: 0
+          });
+          
+          appTracer.endAiRequest(sessionId, currentIteration, false);
+          
           if (this.cancelled || error.name === 'AbortError' || (error.message && error.message.includes('cancelled'))) {
             console.log(`Chat request cancelled during LLM call (Iter ${currentIteration})`);
             this.cancelled = true;
+            appTracer.recordSessionCancellation(sessionId, 'ai_request_cancelled', {
+              currentIteration,
+              activeTool: 'ai_generation'
+            });
             throw new Error('Request was cancelled by the user');
           }
           console.error(`Error during streamText (Iter ${currentIteration}):`, error);
@@ -773,6 +1292,9 @@ When troubleshooting:
         if (parsedTool) {
           const { toolName, params } = parsedTool;
           if (this.debug) console.log(`[DEBUG] Parsed tool call: ${toolName} with params:`, params);
+          
+          // Record tool call parsing in trace
+          appTracer.recordToolCallParsed(sessionId, currentIteration, toolName, params);
 
           if (toolName === 'attempt_completion') {
             completionAttempted = true;
@@ -780,8 +1302,36 @@ When troubleshooting:
             if (!validation.success) {
               finalResult = `Error: AI attempted completion with invalid parameters: ${JSON.stringify(validation.error.issues)}`;
               console.warn(`[WARN] Invalid attempt_completion parameters:`, validation.error.issues);
+              appTracer.recordCompletionAttempt(sessionId, false);
             } else {
               finalResult = validation.data.result;
+              
+              // Store final assistant response in display history
+              const displayAssistantMessage = {
+                role: 'assistant', 
+                content: finalResult,
+                visible: true, 
+                displayType: 'final',
+                timestamp: new Date().toISOString()
+              };
+              this.displayHistory.push(displayAssistantMessage);
+              
+              // Save final response to persistent storage
+              if (this.storage) {
+                this.storage.saveMessage(this.sessionId, {
+                  role: 'assistant',
+                  content: finalResult,
+                  timestamp: Date.now(),
+                  displayType: 'final',
+                  visible: 1,
+                  images: [],
+                  metadata: {}
+                }).catch(err => {
+                  console.error('Failed to save final response to persistent storage:', err);
+                });
+              }
+              
+              appTracer.recordCompletionAttempt(sessionId, true, finalResult);
               if (this.debug) {
                 console.log(`[DEBUG] Completion attempted successfully. Final Result captured.`);
 
@@ -806,6 +1356,12 @@ When troubleshooting:
           } else if (this.toolImplementations[toolName]) {
             const toolInstance = this.toolImplementations[toolName];
             let toolResultContent = '';
+            
+            // Start tool execution trace within iteration context
+            appTracer.withIterationContext(sessionId, currentIteration, () => {
+              appTracer.startToolExecution(sessionId, currentIteration, toolName, params);
+            });
+            
             try {
               const enhancedParams = { ...params, sessionId: this.sessionId };
               if (this.debug) console.log(`[DEBUG] Executing tool '${toolName}' with params:`, enhancedParams);
@@ -815,10 +1371,36 @@ When troubleshooting:
                 const preview = toolResultContent.substring(0, 200).replace(/\n/g, ' ') + (toolResultContent.length > 200 ? '...' : '');
                 console.log(`[DEBUG] Tool '${toolName}' executed successfully. Result preview: ${preview}`);
               }
+              
+              // End tool execution trace with success
+              appTracer.endToolExecution(sessionId, currentIteration, true, toolResultContent.length, null, toolResultContent);
             } catch (error) {
               console.error(`Error executing tool ${toolName}:`, error);
               toolResultContent = `Error executing tool ${toolName}: ${error.message}`;
               if (this.debug) console.log(`[DEBUG] Tool '${toolName}' execution FAILED.`);
+              
+              // Classify and record tool execution error
+              let errorCategory = 'execution';
+              if (error.message?.includes('validation')) {
+                errorCategory = 'validation';
+              } else if (error.message?.includes('permission') || error.message?.includes('access')) {
+                errorCategory = 'filesystem';
+              } else if (error.message?.includes('network') || error.message?.includes('fetch')) {
+                errorCategory = 'network';
+              } else if (error.message?.includes('timeout')) {
+                errorCategory = 'timeout';
+              }
+              
+              appTracer.recordToolError(sessionId, currentIteration, toolName, {
+                category: errorCategory,
+                message: error.message,
+                exitCode: error.code || 0,
+                signal: error.signal || '',
+                params: enhancedParams
+              });
+              
+              // End tool execution trace with failure
+              appTracer.endToolExecution(sessionId, currentIteration, false, 0, error.message, toolResultContent);
             }
 
             const toolResultMessage = `<tool_result>\n${toolResultContent}\n</tool_result>`;
@@ -841,25 +1423,66 @@ When troubleshooting:
         }
 
         if (currentMessages.length > MAX_HISTORY_MESSAGES + 3) {
+          const messagesBefore = currentMessages.length;
           const removeCount = currentMessages.length - MAX_HISTORY_MESSAGES;
           currentMessages = currentMessages.slice(removeCount);
+          
+          // Record in-loop history management
+          appTracer.recordHistoryOperation(sessionId, 'trim', {
+            messagesBefore,
+            messagesAfter: currentMessages.length,
+            messagesRemoved: removeCount,
+            reason: 'loop_memory_limit'
+          });
+          
           if (this.debug) console.log(`[DEBUG] Trimmed 'currentMessages' within loop to ${currentMessages.length} (removed ${removeCount}).`);
           this.tokenCounter.calculateContextSize(currentMessages);
         }
+        
+        // End iteration trace
+        appTracer.endIteration(sessionId, currentIteration, true, completionAttempted ? 'completion_attempted' : 'tool_executed');
       }
 
       if (currentIteration >= MAX_TOOL_ITERATIONS && !completionAttempted) {
         console.warn(`[WARN] Max tool iterations (${MAX_TOOL_ITERATIONS}) reached for session ${this.sessionId}. Returning current error state.`);
       }
+      
+      // End agent loop trace
+      appTracer.endAgentLoop(sessionId, currentIteration, completionAttempted, completionAttempted ? 'completion' : 'max_iterations');
 
       this.history = currentMessages.map(msg => ({ ...msg }));
       if (this.history.length > MAX_HISTORY_MESSAGES) {
+        const messagesBefore = this.history.length;
         const finalRemoveCount = this.history.length - MAX_HISTORY_MESSAGES;
         this.history = this.history.slice(finalRemoveCount);
+        
+        // Record history management operation
+        appTracer.recordHistoryOperation(sessionId, 'trim', {
+          messagesBefore,
+          messagesAfter: this.history.length,
+          messagesRemoved: finalRemoveCount,
+          reason: 'max_length'
+        });
+        
         if (this.debug) console.log(`[DEBUG] Final history trim applied. Length: ${this.history.length} (removed ${finalRemoveCount})`);
       }
 
       this.tokenCounter.updateHistory(this.history);
+      
+      // Record token metrics
+      const tokenUsage = this.tokenCounter.getTokenUsage();
+      appTracer.recordTokenMetrics(sessionId, {
+        contextWindow: tokenUsage.contextWindow || 0,
+        currentTotal: tokenUsage.current?.total || 0,
+        requestTokens: tokenUsage.current?.request || 0,
+        responseTokens: tokenUsage.current?.response || 0,
+        cacheRead: tokenUsage.current?.cacheRead || 0,
+        cacheWrite: tokenUsage.current?.cacheWrite || 0
+      });
+      
+      // End user message processing trace
+      appTracer.endUserMessageProcessing(sessionId, completionAttempted);
+      
       if (this.debug) {
         console.log(`[DEBUG] Updated tokenCounter history with ${this.history.length} messages`);
         console.log(`[DEBUG] Context size after history update: ${this.tokenCounter.contextSize}`);
@@ -884,6 +1507,33 @@ When troubleshooting:
       };
 
     } catch (error) {
+      // Check if this is a critical API error that should cause process exit
+      const isCriticalApiError = this._isCriticalApiError(error);
+      
+      // Record the top-level processing error
+      if (this.cancelled || (error.message && error.message.includes('cancelled'))) {
+        appTracer.recordSessionCancellation(sessionId, 'processing_cancelled', {
+          currentIteration,
+          errorMessage: error.message
+        });
+      } else {
+        // Record as a general processing error
+        appTracer.recordAiModelError(sessionId, currentIteration || 0, {
+          category: isCriticalApiError ? 'critical_api_error' : 'processing_error',
+          message: error.message,
+          model: this.model,
+          provider: this.apiType,
+          statusCode: error.statusCode || 0,
+          retryAttempt: 0
+        });
+      }
+      
+      // End chat session before cleanup to ensure span is properly captured
+      appTracer.endChatSession(sessionId, false, 0);
+      
+      // Clean up any remaining spans for this session (but session span is already ended)
+      appTracer.cleanup(sessionId);
+      
       console.error('Error in chat processing loop:', error);
       if (this.debug) console.error('Error in chat processing loop:', error);
 
@@ -900,6 +1550,12 @@ When troubleshooting:
       if (this.cancelled || (error.message && error.message.includes('cancelled'))) {
         return { response: "Request cancelled.", tokenUsage: updatedTokenUsage };
       }
+      
+      // Re-throw critical API errors so the process exits with code 1
+      if (isCriticalApiError) {
+        throw error;
+      }
+      
       return {
         response: `Error during chat processing: ${error.message || 'An unexpected error occurred.'}`,
         tokenUsage: updatedTokenUsage
@@ -909,6 +1565,47 @@ When troubleshooting:
     }
   }
 
+  /**
+   * Check if an error is a critical API error that should cause process exit
+   * @param {Error} error - The error to check
+   * @returns {boolean} - True if this is a critical API error
+   * @private
+   */
+  _isCriticalApiError(error) {
+    // Check for AI SDK API call errors
+    if (error[Symbol.for('vercel.ai.error.AI_APICallError')]) {
+      const statusCode = error.statusCode;
+      const errorMessage = error.message?.toLowerCase() || '';
+      
+      // Critical HTTP status codes that indicate configuration issues
+      if (statusCode === 401 || statusCode === 403) {
+        return true; // Unauthorized/Forbidden - bad API key
+      }
+      if (statusCode === 404) {
+        return true; // Not Found - wrong URL or model not found
+      }
+      if (statusCode >= 500 && statusCode < 600) {
+        return false; // Server errors - could be temporary, don't exit
+      }
+    }
+    
+    // Check for specific error messages that indicate configuration issues
+    const errorMessage = error.message?.toLowerCase() || '';
+    if (errorMessage.includes('not found')) {
+      return true; // API endpoint not found
+    }
+    if (errorMessage.includes('unauthorized') || errorMessage.includes('invalid api key')) {
+      return true; // Authentication issues
+    }
+    if (errorMessage.includes('forbidden') || errorMessage.includes('access denied')) {
+      return true; // Permission issues
+    }
+    if (errorMessage.includes('empty response from ai model')) {
+      return true; // Indicates API connection/configuration issue
+    }
+    
+    return false; // Other errors are not critical
+  }
 
   /**
    * Get the current token usage summary
@@ -975,3 +1672,6 @@ When troubleshooting:
     return this.sessionId;
   }
 }
+
+// Export the extractImageUrls function for testing
+export { extractImageUrls };

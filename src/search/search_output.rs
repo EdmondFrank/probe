@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::models::SearchResult;
-use crate::search::query::QueryPlan;
-use crate::search::search_tokens::count_tokens;
+use probe_code::models::SearchResult;
+use probe_code::search::query::QueryPlan;
+use probe_code::search::search_tokens::sum_tokens_with_deduplication;
 
 /// Function to format and print search results according to the specified format
 pub fn format_and_print_search_results(
@@ -30,13 +30,13 @@ pub fn format_and_print_search_results(
         }
         "json" => {
             if let Err(e) = format_and_print_json_results(&valid_results) {
-                eprintln!("Error formatting JSON: {}", e);
+                eprintln!("Error formatting JSON: {e}");
             }
             return; // Skip the summary output at the end
         }
         "xml" => {
             if let Err(e) = format_and_print_xml_results(&valid_results) {
-                eprintln!("Error formatting XML: {}", e);
+                eprintln!("Error formatting XML: {e}");
             }
             return; // Skip the summary output at the end
         }
@@ -64,14 +64,18 @@ pub fn format_and_print_search_results(
                     // Normal mode with full content
                     if is_full_file {
                         println!("File: {}", result.file);
-                        println!("```{}", extension);
+                        println!("```{extension}");
                         println!("{}", result.code);
                         println!("```");
                     } else {
                         println!("File: {}", result.file);
-                        println!("Lines: {}-{}", result.lines.0, result.lines.1);
-                        println!("```{}", extension);
-                        println!("{}", result.code);
+                        println!(
+                            "Lines: {start}-{end}",
+                            start = result.lines.0,
+                            end = result.lines.1
+                        );
+                        println!("```{extension}");
+                        println!("{code}", code = result.code);
                         println!("```");
                     }
                 }
@@ -87,65 +91,73 @@ pub fn format_and_print_search_results(
                                 + 1
                         );
 
-                        println!("Rank: {}", rank);
+                        println!("Rank: {rank}");
 
                         if let Some(score) = result.score {
-                            println!("Combined Score: {:.4}", score);
+                            println!("Combined Score: {score:.4}");
                         }
 
                         // Display the combined score rank if available, otherwise calculate it
                         if let Some(combined_rank) = result.combined_score_rank {
-                            println!("Combined Score Rank: {}", combined_rank);
+                            println!("Combined Score Rank: {combined_rank}");
                         } else {
                             // Fall back to the old behavior if the field isn't set
-                            println!("Combined Score Rank: {}", rank);
+                            println!("Combined Score Rank: {rank}");
                         }
 
                         if let Some(tfidf_score) = result.tfidf_score {
-                            println!("TF-IDF Score: {:.4}", tfidf_score);
+                            println!("TF-IDF Score: {tfidf_score:.4}");
                         }
 
                         if let Some(tfidf_rank) = result.tfidf_rank {
-                            println!("TF-IDF Rank: {}", tfidf_rank);
+                            println!("TF-IDF Rank: {tfidf_rank}");
                         }
 
                         if let Some(bm25_score) = result.bm25_score {
-                            println!("BM25 Score: {:.4}", bm25_score);
+                            // Check if this is actually a BERT score by looking at the rank field
+                            // When BERT reranking is used, both score and bm25_score are set to BERT score
+                            let is_bert_score =
+                                result.score == result.bm25_score && result.score.is_some();
+                            if is_bert_score {
+                                println!("BERT Score: {bm25_score:.4}");
+                            } else {
+                                println!("BM25 Score: {bm25_score:.4}");
+                            }
                         }
 
                         if let Some(bm25_rank) = result.bm25_rank {
-                            println!("BM25 Rank: {}", bm25_rank);
+                            println!("BM25 Rank: {bm25_rank}");
                         }
 
                         // Display Hybrid 2 score and rank with more prominence
                         if let Some(new_score) = result.new_score {
-                            println!("Hybrid 2 Score: {:.4}", new_score);
+                            println!("Hybrid 2 Score: {new_score:.4}");
                         }
 
                         if let Some(hybrid2_rank) = result.hybrid2_rank {
-                            println!("Hybrid 2 Rank: {}", hybrid2_rank);
+                            println!("Hybrid 2 Rank: {hybrid2_rank}");
                         } else if result.new_score.is_some() {
                             println!("Hybrid 2 Rank: N/A");
                         }
 
                         if let Some(file_unique_terms) = result.file_unique_terms {
-                            println!("File Unique Terms: {}", file_unique_terms);
+                            println!("File Unique Terms: {file_unique_terms}");
                         }
 
                         if let Some(file_total_matches) = result.file_total_matches {
-                            println!("File Total Matches: {}", file_total_matches);
+                            println!("File Total Matches: {file_total_matches}");
                         }
 
                         if let Some(file_match_rank) = result.file_match_rank {
-                            println!("File Match Rank: {}", file_match_rank);
+                            println!("File Match Rank: {file_match_rank}");
                         }
 
                         if let Some(block_unique_terms) = result.block_unique_terms {
-                            println!("Block Unique Terms: {}", block_unique_terms);
+                            println!("Block Unique Terms: {block_unique_terms}");
                         }
 
                         if let Some(block_total_matches) = result.block_total_matches {
-                            println!("Block Total Matches: {}", block_total_matches);
+                            println!("Block Total Matches: {block_total_matches}");
                         }
 
                         println!("Type: {}", result.node_type);
@@ -155,12 +167,18 @@ pub fn format_and_print_search_results(
         }
     }
 
-    println!("Found {} search results", valid_results.len());
+    println!("Found {count} search results", count = valid_results.len());
 
     let total_bytes: usize = valid_results.iter().map(|r| r.code.len()).sum();
-    let total_tokens: usize = valid_results.iter().map(|r| count_tokens(&r.code)).sum();
-    println!("Total bytes returned: {}", total_bytes);
-    println!("Total tokens returned: {}", total_tokens);
+
+    // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION:
+    // Use batch processing with content deduplication for improved performance
+    // when multiple identical code blocks need tokenization (common in search results)
+    let code_blocks: Vec<&str> = valid_results.iter().map(|r| r.code.as_str()).collect();
+    let total_tokens: usize = sum_tokens_with_deduplication(&code_blocks);
+    println!("Total bytes returned: {total_bytes}");
+    println!("Total tokens returned: {total_tokens}");
+    println!("Probe version: {}", probe_code::version::get_version());
 }
 
 /// Format and print search results with color highlighting for matching words
@@ -203,7 +221,11 @@ fn format_and_print_color_results(
 
         // Print the file path and node info with color
         if is_full_file {
-            println!("{} {}", "File:".bold().green(), result.file.yellow());
+            println!(
+                "{label} {file}",
+                label = "File:".bold().green().yellow(),
+                file = result.file
+            );
         } else {
             println!(
                 "{} {} ({})",
@@ -223,13 +245,13 @@ fn format_and_print_color_results(
         if debug_mode {
             // Print the same debug info that would be shown in standard mode
             if let Some(keywords) = &result.matched_keywords {
-                println!("{} {:?}", "Matched Keywords:".bold().green(), keywords);
+                println!("{} {keywords:?}", "Matched Keywords:".bold().green());
             }
             if let Some(score) = result.score {
-                println!("{} {:.4}", "Score:".bold().green(), score);
+                println!("{} {score:.4}", "Score:".bold().green());
             }
             if let Some(query_plan) = query_plan {
-                println!("{} {:?}", "Query Plan:".bold().green(), query_plan);
+                println!("{} {query_plan:?}", "Query Plan:".bold().green());
             }
         }
 
@@ -271,13 +293,13 @@ fn format_and_print_color_results(
             _ => "",
         };
 
-        println!("{}", "Code:".bold().magenta());
+        println!("{label}", label = "Code:".bold().magenta());
 
         // Print the code with syntax highlighting
         if !language.is_empty() {
-            println!("{}", format!("```{}", language).cyan());
+            println!("{code_block}", code_block = format!("```{language}").cyan());
         } else {
-            println!("{}", "```".cyan());
+            println!("{code_block}", code_block = "```".cyan());
         }
 
         // Generate patterns from the matched keywords in the search result
@@ -363,9 +385,9 @@ fn format_and_print_color_results(
 
             // Print the line (highlighted or original if no matches)
             if !merged_matches.is_empty() {
-                println!("{}", output_line);
+                println!("{output_line}");
             } else {
-                println!("{}", line);
+                println!("{line}");
             }
         }
 
@@ -374,7 +396,7 @@ fn format_and_print_color_results(
         // Print a separator between results
         if index < results.len() - 1 {
             println!();
-            println!("{}", "─".repeat(50).cyan());
+            println!("{separator}", separator = "─".repeat(50).cyan());
             println!();
         }
 
@@ -390,65 +412,72 @@ fn format_and_print_color_results(
                         + 1
                 );
 
-                println!("Rank: {}", rank);
+                println!("Rank: {rank}");
 
                 if let Some(score) = result.score {
-                    println!("Combined Score: {:.4}", score);
+                    println!("Combined Score: {score:.4}");
                 }
 
                 // Display the combined score rank if available, otherwise calculate it
                 if let Some(combined_rank) = result.combined_score_rank {
-                    println!("Combined Score Rank: {}", combined_rank);
+                    println!("Combined Score Rank: {combined_rank}");
                 } else {
                     // Fall back to the old behavior if the field isn't set
-                    println!("Combined Score Rank: {}", rank);
+                    println!("Combined Score Rank: {rank}");
                 }
 
                 if let Some(tfidf_score) = result.tfidf_score {
-                    println!("TF-IDF Score: {:.4}", tfidf_score);
+                    println!("TF-IDF Score: {tfidf_score:.4}");
                 }
 
                 if let Some(tfidf_rank) = result.tfidf_rank {
-                    println!("TF-IDF Rank: {}", tfidf_rank);
+                    println!("TF-IDF Rank: {tfidf_rank}");
                 }
 
                 if let Some(bm25_score) = result.bm25_score {
-                    println!("BM25 Score: {:.4}", bm25_score);
+                    // Check if this is actually a BERT score by looking at the rank field
+                    // When BERT reranking is used, both score and bm25_score are set to BERT score
+                    let is_bert_score = result.score == result.bm25_score && result.score.is_some();
+                    if is_bert_score {
+                        println!("BERT Score: {bm25_score:.4}");
+                    } else {
+                        println!("BM25 Score: {bm25_score:.4}");
+                    }
                 }
 
                 if let Some(bm25_rank) = result.bm25_rank {
-                    println!("BM25 Rank: {}", bm25_rank);
+                    println!("BM25 Rank: {bm25_rank}");
                 }
 
                 // Display Hybrid 2 score and rank with more prominence
                 if let Some(new_score) = result.new_score {
-                    println!("Hybrid 2 Score: {:.4}", new_score);
+                    println!("Hybrid 2 Score: {new_score:.4}");
                 }
 
                 if let Some(hybrid2_rank) = result.hybrid2_rank {
-                    println!("Hybrid 2 Rank: {}", hybrid2_rank);
+                    println!("Hybrid 2 Rank: {hybrid2_rank}");
                 } else if result.new_score.is_some() {
                     println!("Hybrid 2 Rank: N/A");
                 }
 
                 if let Some(file_unique_terms) = result.file_unique_terms {
-                    println!("File Unique Terms: {}", file_unique_terms);
+                    println!("File Unique Terms: {file_unique_terms}");
                 }
 
                 if let Some(file_total_matches) = result.file_total_matches {
-                    println!("File Total Matches: {}", file_total_matches);
+                    println!("File Total Matches: {file_total_matches}");
                 }
 
                 if let Some(file_match_rank) = result.file_match_rank {
-                    println!("File Match Rank: {}", file_match_rank);
+                    println!("File Match Rank: {file_match_rank}");
                 }
 
                 if let Some(block_unique_terms) = result.block_unique_terms {
-                    println!("Block Unique Terms: {}", block_unique_terms);
+                    println!("Block Unique Terms: {block_unique_terms}");
                 }
 
                 if let Some(block_total_matches) = result.block_total_matches {
-                    println!("Block Total Matches: {}", block_total_matches);
+                    println!("Block Total Matches: {block_total_matches}");
                 }
 
                 println!("Type: {}", result.node_type);
@@ -504,17 +533,23 @@ fn format_and_print_json_results(results: &[&SearchResult]) -> Result<()> {
         })
         .collect();
 
+    // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for JSON output:
+    // Process all code blocks in batch to leverage content deduplication
+    let code_blocks: Vec<&str> = results.iter().map(|r| r.code.as_str()).collect();
+    let total_tokens = sum_tokens_with_deduplication(&code_blocks);
+
     // Create a wrapper object with results and summary
     let wrapper = serde_json::json!({
         "results": json_results,
         "summary": {
             "count": results.len(),
             "total_bytes": results.iter().map(|r| r.code.len()).sum::<usize>(),
-            "total_tokens": results.iter().map(|r| count_tokens(&r.code)).sum::<usize>(),
-        }
+            "total_tokens": total_tokens,
+        },
+        "version": probe_code::version::get_version()
     });
 
-    println!("{}", serde_json::to_string_pretty(&wrapper)?);
+    println!("{json}", json = serde_json::to_string_pretty(&wrapper)?);
     Ok(())
 }
 
@@ -525,8 +560,12 @@ fn format_and_print_xml_results(results: &[&SearchResult]) -> Result<()> {
 
     for result in results {
         println!("  <result>");
-        println!("    <file>{}</file>", escape_xml(&result.file));
-        println!("    <lines>{}-{}</lines>", result.lines.0, result.lines.1);
+        println!("    <file>{file}</file>", file = escape_xml(&result.file));
+        println!(
+            "    <lines>{start}-{end}</lines>",
+            start = result.lines.0,
+            end = result.lines.1
+        );
         println!(
             "    <node_type>{}</node_type>",
             escape_xml(&result.node_type)
@@ -535,52 +574,43 @@ fn format_and_print_xml_results(results: &[&SearchResult]) -> Result<()> {
         if let Some(keywords) = &result.matched_keywords {
             println!("    <matched_keywords>");
             for keyword in keywords {
-                println!("      <keyword>{}</keyword>", escape_xml(keyword));
+                println!(
+                    "      <keyword>{keyword}</keyword>",
+                    keyword = escape_xml(keyword)
+                );
             }
             println!("    </matched_keywords>");
         }
 
         if let Some(score) = result.score {
-            println!("    <score>{:.4}</score>", score);
+            println!("    <score>{score:.4}</score>");
         }
 
         if let Some(tfidf_score) = result.tfidf_score {
-            println!("    <tfidf_score>{:.4}</tfidf_score>", tfidf_score);
+            println!("    <tfidf_score>{tfidf_score:.4}</tfidf_score>");
         }
 
         if let Some(bm25_score) = result.bm25_score {
-            println!("    <bm25_score>{:.4}</bm25_score>", bm25_score);
+            println!("    <bm25_score>{bm25_score:.4}</bm25_score>");
         }
 
         if let Some(file_unique_terms) = result.file_unique_terms {
-            println!(
-                "    <file_unique_terms>{}</file_unique_terms>",
-                file_unique_terms
-            );
+            println!("    <file_unique_terms>{file_unique_terms}</file_unique_terms>");
         }
 
         if let Some(file_total_matches) = result.file_total_matches {
-            println!(
-                "    <file_total_matches>{}</file_total_matches>",
-                file_total_matches
-            );
+            println!("    <file_total_matches>{file_total_matches}</file_total_matches>");
         }
 
         if let Some(block_unique_terms) = result.block_unique_terms {
-            println!(
-                "    <block_unique_terms>{}</block_unique_terms>",
-                block_unique_terms
-            );
+            println!("    <block_unique_terms>{block_unique_terms}</block_unique_terms>");
         }
 
         if let Some(block_total_matches) = result.block_total_matches {
-            println!(
-                "    <block_total_matches>{}</block_total_matches>",
-                block_total_matches
-            );
+            println!("    <block_total_matches>{block_total_matches}</block_total_matches>");
         }
 
-        println!("    <code><![CDATA[{}]]></code>", result.code);
+        println!("    <code><![CDATA[{code}]]></code>", code = result.code);
         println!("  </result>");
     }
 
@@ -588,14 +618,21 @@ fn format_and_print_xml_results(results: &[&SearchResult]) -> Result<()> {
     println!("  <summary>");
     println!("    <count>{}</count>", results.len());
     println!(
-        "    <total_bytes>{}</total_bytes>",
-        results.iter().map(|r| r.code.len()).sum::<usize>()
+        "    <total_bytes>{total_bytes}</total_bytes>",
+        total_bytes = results.iter().map(|r| r.code.len()).sum::<usize>()
     );
-    println!(
-        "    <total_tokens>{}</total_tokens>",
-        results.iter().map(|r| count_tokens(&r.code)).sum::<usize>()
-    );
+    // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for XML output:
+    // Process all code blocks in batch to leverage content deduplication
+    let code_blocks: Vec<&str> = results.iter().map(|r| r.code.as_str()).collect();
+    let total_tokens = sum_tokens_with_deduplication(&code_blocks);
+
+    println!("    <total_tokens>{total_tokens}</total_tokens>");
     println!("  </summary>");
+
+    println!(
+        "  <version>{}</version>",
+        probe_code::version::get_version()
+    );
 
     println!("</probe_results>");
     Ok(())

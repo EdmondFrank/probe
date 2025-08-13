@@ -1,7 +1,10 @@
-use probe::search::elastic_query::{self, parse_query_test as parse_query};
-use probe::search::file_processing::filter_code_block_with_ast;
-use probe::search::query::create_query_plan;
+use lru::LruCache;
+use probe_code::search::elastic_query::{self, parse_query_test as parse_query};
+use probe_code::search::file_processing::filter_code_block_with_ast;
+use probe_code::search::query::create_query_plan;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 /// Test direct usage of filter_code_block_with_ast with various complex queries
 #[test]
@@ -38,7 +41,7 @@ fn test_simple_and_query() {
     // Parse the query into an AST
     // Using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();
@@ -121,7 +124,7 @@ fn test_simple_or_query() {
     // Parse the query into an AST
     // Using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();
@@ -218,7 +221,7 @@ fn test_complex_query_with_negation() {
     // Parse the query into an AST
     // Using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();
@@ -419,7 +422,7 @@ fn test_required_terms_query() {
             exact: false,
         }),
     );
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a custom QueryPlan with our AST
     let mut indices = HashMap::new();
@@ -428,11 +431,22 @@ fn test_required_terms_query() {
     indices.insert("secur".to_string(), 2);
     indices.insert("white".to_string(), 3);
 
-    let plan = probe::search::query::QueryPlan {
+    let has_required_anywhere = ast.has_required_term();
+    let has_only_excluded_terms = ast.is_only_excluded_terms();
+    let required_terms_indices = HashSet::new();
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
+    let plan = probe_code::search::query::QueryPlan {
         ast: ast.clone(),
         term_indices: indices.clone(),
         excluded_terms: HashSet::new(),
         exact: false,
+        is_simple_query: false,
+        required_terms: HashSet::new(),
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
     };
 
     // Use the term indices directly
@@ -492,13 +506,13 @@ fn test_required_terms_query() {
 
         // Test filtering
         let result = filter_code_block_with_ast(block_lines, &term_matches, &plan, true);
-        // Note: With the simplified evaluation, required terms with + are connected with OR, not AND
-        // So the test should pass even if one required term is missing
+        // Note: In correct Lucene semantics, ALL required terms must be present
+        // This block is missing 'security', so it should NOT match
         assert!(
-            result,
-            "Block with some required terms should match with OR semantics"
+            !result,
+            "Block missing required term 'security' should NOT match"
         );
-        println!("✓ Block with some required terms matches (OR semantics)");
+        println!("✓ Block missing required terms correctly rejected");
     }
 }
 
@@ -514,7 +528,7 @@ fn test_nested_expressions_query() {
     // Parse the query into an AST
     // Using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();

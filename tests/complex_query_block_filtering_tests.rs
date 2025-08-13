@@ -3,10 +3,10 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use probe::search::elastic_query::parse_query_test as parse_query;
-use probe::search::file_processing::filter_code_block_with_ast;
-use probe::search::query::create_query_plan;
-use probe::search::{perform_probe, SearchOptions};
+use probe_code::search::elastic_query::parse_query_test as parse_query;
+use probe_code::search::file_processing::filter_code_block_with_ast;
+use probe_code::search::query::create_query_plan;
+use probe_code::search::{perform_probe, SearchOptions};
 
 /// Test complex boolean expressions for block filtering
 #[test]
@@ -107,7 +107,7 @@ fn test_complex_query_filtering(_temp_path: &Path) {
 
     // Parse the query into an AST using standard Elasticsearch behavior (AND for implicit combinations)
     let ast = parse_query(query).unwrap();
-    println!("Parsed AST: {:?}", ast);
+    println!("Parsed AST: {ast:?}");
 
     // Create a QueryPlan
     let plan = create_query_plan(query, false).unwrap();
@@ -309,7 +309,9 @@ func (i *IPWhiteListMiddleware) Process() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search
@@ -388,7 +390,9 @@ func Process() {
         dry_run: false,
         session: None,
         timeout: 30,
+        question: None,
         exact: false,
+        no_gitignore: false,
     };
 
     // Run the search

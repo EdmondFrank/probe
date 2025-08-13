@@ -1,7 +1,18 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::str::Chars;
+
+// PHASE 3C OPTIMIZATION: Compute hash key for evaluation cache
+fn compute_evaluation_key(matched_terms: &HashSet<usize>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    let mut sorted_terms: Vec<_> = matched_terms.iter().cloned().collect();
+    sorted_terms.sort_unstable();
+    sorted_terms.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// The AST representing a parsed query.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,11 +79,66 @@ impl Expr {
     }
 
     /// Returns `true` if this expression contains at least one `required=true` term.
-    fn has_required_term(&self) -> bool {
+    pub fn has_required_term(&self) -> bool {
         match self {
             Expr::Term { required, .. } => *required,
             Expr::And(left, right) | Expr::Or(left, right) => {
                 left.has_required_term() || right.has_required_term()
+            }
+        }
+    }
+
+    /// Returns `true` if this expression contains only excluded terms.
+    /// This is used for early termination optimization.
+    pub fn is_only_excluded_terms(&self) -> bool {
+        match self {
+            Expr::Term { excluded, .. } => *excluded,
+            Expr::And(left, right) => {
+                left.is_only_excluded_terms() && right.is_only_excluded_terms()
+            }
+            Expr::Or(left, right) => {
+                left.is_only_excluded_terms() && right.is_only_excluded_terms()
+            }
+        }
+    }
+
+    /// Check if all required terms in the expression are present in matched_terms
+    /// This is the critical fix for Lucene semantics
+    fn check_all_required_terms_present(
+        &self,
+        matched_terms: &HashSet<usize>,
+        term_indices: &HashMap<String, usize>,
+    ) -> bool {
+        match self {
+            Expr::Term {
+                keywords,
+                required,
+                excluded,
+                ..
+            } => {
+                if *required && !*excluded {
+                    // All keywords in this required term must be present
+                    keywords.iter().all(|kw| {
+                        term_indices
+                            .get(kw)
+                            .map(|idx| matched_terms.contains(idx))
+                            .unwrap_or(false)
+                    })
+                } else {
+                    // Not a required term, so it doesn't affect required term checking
+                    true
+                }
+            }
+            Expr::And(left, right) => {
+                // For AND: both sides must have their required terms satisfied
+                left.check_all_required_terms_present(matched_terms, term_indices)
+                    && right.check_all_required_terms_present(matched_terms, term_indices)
+            }
+            Expr::Or(left, right) => {
+                // For OR: both sides must have their required terms satisfied
+                // This is crucial - even in OR, required terms must be present
+                left.check_all_required_terms_present(matched_terms, term_indices)
+                    && right.check_all_required_terms_present(matched_terms, term_indices)
             }
         }
     }
@@ -86,7 +152,26 @@ impl Expr {
         ignore_negatives: bool,
         has_required_anywhere: bool,
     ) -> bool {
+        // Early termination optimization: if no terms matched, result is always false
+        // (unless we have only excluded terms, but that's handled below)
+        if matched_terms.is_empty() && !self.is_only_excluded_terms() {
+            return false;
+        }
+
         let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+
+        // CRITICAL FIX: Check required terms FIRST before any other evaluation
+        // In Lucene semantics, if ANY required term is missing, the entire query fails
+        if has_required_anywhere && !ignore_negatives {
+            let all_required_terms_present =
+                self.check_all_required_terms_present(matched_terms, term_indices);
+            if !all_required_terms_present {
+                if debug_mode {
+                    println!("DEBUG: Query failed - required terms missing");
+                }
+                return false;
+            }
+        }
 
         match self {
             Expr::Term {
@@ -180,9 +265,6 @@ impl Expr {
                 lval && rval
             }
             Expr::Or(left, right) => {
-                // For OR expressions, we need to be careful about how we handle has_required_anywhere
-                // We want to maintain the behavior that at least one term must be present
-
                 let lval = left.evaluate_with_has_required(
                     matched_terms,
                     term_indices,
@@ -209,13 +291,76 @@ impl Expr {
         }
     }
 
+    // PHASE 3C OPTIMIZATION: Fast-path evaluation for simple queries
+    pub fn evaluate_fast_path(
+        &self,
+        matched_terms: &HashSet<usize>,
+        plan: &crate::search::query::QueryPlan,
+    ) -> Option<bool> {
+        // Fast path for simple single-term queries
+        if plan.is_simple_query {
+            return Some(!matched_terms.is_empty());
+        }
+
+        // Fast path: if no terms matched and query requires some terms
+        if matched_terms.is_empty() && !plan.has_only_excluded_terms {
+            return Some(false);
+        }
+
+        // Fast path: if all required terms are missing
+        if !plan.required_terms_indices.is_empty() {
+            let has_all_required = plan
+                .required_terms_indices
+                .iter()
+                .all(|idx| matched_terms.contains(idx));
+            if !has_all_required {
+                return Some(false);
+            }
+        }
+
+        None // Fall back to full evaluation
+    }
+
+    // PHASE 3C OPTIMIZATION: Cached evaluation
+    pub fn evaluate_with_cache(
+        &self,
+        matched_terms: &HashSet<usize>,
+        plan: &crate::search::query::QueryPlan,
+    ) -> bool {
+        // Try fast path first
+        if let Some(result) = self.evaluate_fast_path(matched_terms, plan) {
+            return result;
+        }
+
+        // Compute cache key from matched terms
+        let cache_key = compute_evaluation_key(matched_terms);
+
+        // Check cache
+        if let Ok(mut cache) = plan.evaluation_cache.lock() {
+            if let Some(&cached_result) = cache.peek(&cache_key) {
+                return cached_result;
+            }
+
+            // Perform full evaluation
+            let result = self.evaluate(matched_terms, &plan.term_indices, false);
+
+            // Cache the result
+            cache.put(cache_key, result);
+
+            result
+        } else {
+            // If we can't lock the cache, just evaluate without caching
+            self.evaluate(matched_terms, &plan.term_indices, false)
+        }
+    }
+
     /// Evaluate whether a set of matched term indices satisfies this logical expression.
     ///
     /// - Term: check if **all** of its keywords are present (optional/required), or
     ///   if **none** are present (excluded).
     /// - AND => both sides must match.
     /// - OR => at least one side must match.
-    /// - `ignore_negatives` => if true, excluded terms are basically ignored (they don’t exclude).
+    /// - `ignore_negatives` => if true, excluded terms are basically ignored (they don't exclude).
     /// - Field is **ignored** in evaluation, per request.
     pub fn evaluate(
         &self,
@@ -223,6 +368,11 @@ impl Expr {
         term_indices: &HashMap<String, usize>,
         ignore_negatives: bool,
     ) -> bool {
+        // Early termination optimization
+        if matched_terms.is_empty() && !self.is_only_excluded_terms() {
+            return false;
+        }
+
         let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
         // If ignoring negatives, let's ensure that all required terms are present up front.
@@ -256,16 +406,13 @@ impl Expr {
             }
             let required_terms = collect_required(self);
             if debug_mode && !required_terms.is_empty() {
-                println!(
-                    "DEBUG: Required terms (ignoring negatives): {:?}",
-                    required_terms
-                );
+                println!("DEBUG: Required terms (ignoring negatives): {required_terms:?}");
             }
             for term in &required_terms {
                 if let Some(&idx) = term_indices.get(term) {
                     if !matched_terms.contains(&idx) {
                         if debug_mode {
-                            println!("DEBUG: Missing required term '{}' (idx={})", term, idx);
+                            println!("DEBUG: Missing required term '{term}' (idx={idx})");
                         }
                         return false;
                     }
@@ -280,13 +427,10 @@ impl Expr {
         let has_required_anywhere = self.has_required_term();
 
         if debug_mode {
-            println!("DEBUG: Evaluating => {:?}", self);
-            println!("DEBUG: matched_terms => {:?}", matched_terms);
-            println!("DEBUG: term_indices => {:?}", term_indices);
-            println!(
-                "DEBUG: Expression has_required_anywhere? {}",
-                has_required_anywhere
-            );
+            println!("DEBUG: Evaluating => {self:?}");
+            println!("DEBUG: matched_terms => {matched_terms:?}");
+            println!("DEBUG: term_indices => {term_indices:?}");
+            println!("DEBUG: Expression has_required_anywhere? {has_required_anywhere}");
         }
 
         // Delegate final checks to our helper, which references has_required_anywhere
@@ -317,7 +461,7 @@ impl std::fmt::Display for Expr {
                     ""
                 };
                 let field_prefix = if let Some(ref field_name) = field {
-                    format!("{}:", field_name)
+                    format!("{field_name}:")
                 } else {
                     String::new()
                 };
@@ -331,8 +475,8 @@ impl std::fmt::Display for Expr {
                     write!(f, "{}{}\"{}\"", prefix, field_prefix, keywords.join(" "))
                 }
             }
-            Expr::And(left, right) => write!(f, "({} AND {})", left, right),
-            Expr::Or(left, right) => write!(f, "({} OR {})", left, right),
+            Expr::And(left, right) => write!(f, "({left} AND {right})"),
+            Expr::Or(left, right) => write!(f, "({left} OR {right})"),
         }
     }
 }
@@ -362,10 +506,10 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::UnexpectedChar(c) => write!(f, "Unexpected character '{}'", c),
+            ParseError::UnexpectedChar(c) => write!(f, "Unexpected character '{c}'"),
             ParseError::UnexpectedEndOfInput => write!(f, "Unexpected end of input"),
-            ParseError::UnexpectedToken(t) => write!(f, "Unexpected token '{:?}'", t),
-            ParseError::Generic(s) => write!(f, "{}", s),
+            ParseError::UnexpectedToken(t) => write!(f, "Unexpected token '{t:?}'"),
+            ParseError::Generic(s) => write!(f, "{s}"),
         }
     }
 }
@@ -423,7 +567,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 } else {
                     // Skip unknown characters
                     if debug_mode {
-                        println!("DEBUG: Skipping unknown character '{}'", ch);
+                        println!("DEBUG: Skipping unknown character '{ch}'");
                     }
                     chars.next();
                 }
@@ -467,7 +611,7 @@ fn lex_quoted_string(chars: &mut Peekable<Chars>) -> Result<String, ParseError> 
 fn lex_identifier(chars: &mut Peekable<Chars>) -> String {
     let mut buf = String::new();
     while let Some(&ch) = chars.peek() {
-        if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+        if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
             buf.push(ch);
             chars.next();
         } else {
@@ -478,7 +622,7 @@ fn lex_identifier(chars: &mut Peekable<Chars>) -> String {
 }
 
 // Adjust paths to match your project structure
-use crate::search::tokenization::{add_special_term, tokenize as custom_tokenize};
+use probe_code::search::tokenization::{add_special_term, tokenize as custom_tokenize};
 
 struct Parser {
     tokens: Vec<Token>,
@@ -517,7 +661,7 @@ impl Parser {
     fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
         let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
         if debug_mode {
-            println!("DEBUG: parse_or_expr => pos={}", self.pos);
+            println!("DEBUG: parse_or_expr => pos={pos}", pos = self.pos);
         }
 
         let mut left = self.parse_and_expr()?;
@@ -527,7 +671,7 @@ impl Parser {
             let right = self.parse_and_expr()?;
             left = Expr::Or(Box::new(left), Box::new(right));
             if debug_mode {
-                println!("DEBUG: OR => {:?}", left);
+                println!("DEBUG: OR => {left:?}");
             }
         }
         Ok(left)
@@ -536,7 +680,7 @@ impl Parser {
     fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
         let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
         if debug_mode {
-            println!("DEBUG: parse_and_expr => pos={}", self.pos);
+            println!("DEBUG: parse_and_expr => pos={pos}", pos = self.pos);
         }
 
         let mut left = self.parse_factor()?;
@@ -549,7 +693,7 @@ impl Parser {
                     let right = self.parse_factor()?;
                     left = Expr::And(Box::new(left), Box::new(right));
                     if debug_mode {
-                        println!("DEBUG: AND => {:?}", left);
+                        println!("DEBUG: AND => {left:?}");
                     }
                 }
                 // If we see "OR", break so parse_or_expr can handle it
@@ -561,21 +705,23 @@ impl Parser {
                     let right = self.parse_factor()?;
                     left = Expr::And(Box::new(left), Box::new(right));
                     if debug_mode {
-                        println!("DEBUG: forced AND => {:?}", left);
+                        println!("DEBUG: forced AND => {left:?}");
                     }
                 }
                 // Otherwise (Ident, QuotedString, LParen) => implicit combos
                 Token::Ident(_) | Token::QuotedString(_) | Token::LParen => {
                     let right = self.parse_factor()?;
-                    // Use OR for implicit combinations (space-separated terms) - Elasticsearch standard behavior
+                    // True Lucene/Elasticsearch semantics: implicit combinations are always OR
+                    // The + and - operators only affect individual terms, not the combination logic
                     left = Expr::Or(Box::new(left), Box::new(right));
                     if debug_mode {
-                        println!("DEBUG: implicit OR => {:?}", left);
+                        println!("DEBUG: implicit OR => {left:?}");
                     }
                 }
                 _ => break,
             }
         }
+
         Ok(left)
     }
 
@@ -639,10 +785,7 @@ impl Parser {
             };
 
             if debug_mode {
-                println!(
-                    "DEBUG: parse_prefixed_term => required={}, excluded={}, final_keywords={:?}",
-                    required, excluded, final_keywords
-                );
+                println!("DEBUG: parse_prefixed_term => required={required}, excluded={excluded}, final_keywords={final_keywords:?}");
             }
 
             Ok(Expr::Term {
@@ -667,7 +810,7 @@ impl Parser {
                 let val = s.clone();
                 self.next();
                 if debug_mode {
-                    println!("DEBUG: QuotedString => {}", val);
+                    println!("DEBUG: QuotedString => {val}");
                 }
                 Ok(Expr::Term {
                     keywords: vec![val],
@@ -683,7 +826,7 @@ impl Parser {
                     unreachable!()
                 };
                 if debug_mode {
-                    println!("DEBUG: Ident => {}", first);
+                    println!("DEBUG: Ident => {first}");
                 }
                 if let Some(Token::Colon) = self.peek() {
                     // We have "field:"
@@ -743,7 +886,7 @@ pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
-        println!("DEBUG: parse_query('{}', exact={})", input, exact);
+        println!("DEBUG: parse_query('{input}', exact={exact})");
     }
 
     // If exact search is enabled, treat the entire query as a single term
@@ -763,7 +906,7 @@ pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
     // Tokenize
     let tokens_result = tokenize(input);
     if debug_mode {
-        println!("DEBUG: Tokens => {:?}", tokens_result);
+        println!("DEBUG: Tokens => {tokens_result:?}");
     }
 
     // If tokenization fails => fallback

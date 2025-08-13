@@ -1,7 +1,7 @@
-use crate::search::tokenization;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use lazy_static::lazy_static;
+use probe_code::search::tokenization;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -26,20 +26,33 @@ lazy_static! {
 /// Helper function to format duration in a human-readable way
 fn format_duration(duration: std::time::Duration) -> String {
     if duration.as_millis() < 1000 {
-        format!("{}ms", duration.as_millis())
+        let duration_millis = duration.as_millis();
+        format!("{duration_millis}ms")
     } else {
-        format!("{:.2}s", duration.as_secs_f64())
+        let duration_secs = duration.as_secs_f64();
+        format!("{duration_secs:.2}s")
     }
 }
 
 /// Generate a cache key for a specific directory and options
-fn generate_cache_key(path: &Path, allow_tests: bool, custom_ignores: &[String]) -> String {
+fn generate_cache_key(
+    path: &Path,
+    allow_tests: bool,
+    custom_ignores: &[String],
+    no_gitignore: bool,
+) -> String {
     // Create a unique identifier for this cache based on the path and options
     let path_str = path.to_string_lossy();
     let allow_tests_str = if allow_tests {
         "with_tests"
     } else {
         "no_tests"
+    };
+
+    let gitignore_str = if no_gitignore {
+        "no_gitignore"
+    } else {
+        "with_gitignore"
     };
 
     // Create a hash of the custom ignores to include in the cache key
@@ -53,10 +66,10 @@ fn generate_cache_key(path: &Path, allow_tests: bool, custom_ignores: &[String])
                 hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
             }
         }
-        format!("ignores_{:x}", hash)
+        format!("ignores_{hash:x}")
     };
 
-    format!("{}_{}_{}", path_str, allow_tests_str, ignores_hash)
+    format!("{path_str}_{allow_tests_str}_{ignores_hash}_{gitignore_str}")
 }
 
 /// Get a list of files in a directory, respecting ignore patterns and test file exclusions.
@@ -65,18 +78,20 @@ pub fn get_file_list(
     path: &Path,
     allow_tests: bool,
     custom_ignores: &[String],
+    no_gitignore: bool,
 ) -> Result<Arc<FileList>> {
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
-        println!("DEBUG: Getting file list for path: {:?}", path);
-        println!("DEBUG: allow_tests: {}", allow_tests);
-        println!("DEBUG: custom_ignores: {:?}", custom_ignores);
+        println!("DEBUG: Getting file list for path: {path:?}");
+        println!("DEBUG: allow_tests: {allow_tests}");
+        println!("DEBUG: custom_ignores: {custom_ignores:?}");
+        println!("DEBUG: no_gitignore: {no_gitignore}");
     }
 
     // Create a cache key for this request
-    let cache_key = generate_cache_key(path, allow_tests, custom_ignores);
+    let cache_key = generate_cache_key(path, allow_tests, custom_ignores, no_gitignore);
 
     // Check if we have this file list in the cache
     {
@@ -99,7 +114,7 @@ pub fn get_file_list(
         println!("DEBUG: File list not found in cache, building new list");
     }
 
-    let file_list = build_file_list(path, allow_tests, custom_ignores)?;
+    let file_list = build_file_list(path, allow_tests, custom_ignores, no_gitignore)?;
     let file_count = file_list.files.len();
 
     // Cache the file list
@@ -122,22 +137,36 @@ pub fn get_file_list(
 }
 
 /// Build a list of files in a directory, respecting ignore patterns and test file exclusions.
-fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) -> Result<FileList> {
+fn build_file_list(
+    path: &Path,
+    allow_tests: bool,
+    custom_ignores: &[String],
+    no_gitignore: bool,
+) -> Result<FileList> {
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
-        println!("DEBUG: Building file list for path: {:?}", path);
+        println!("DEBUG: Building file list for path: {path:?}");
     }
 
     // Create a WalkBuilder that respects .gitignore files and common ignore patterns
     let builder_start = Instant::now();
     let mut builder = WalkBuilder::new(path);
 
-    // Configure the builder
-    builder.git_ignore(true);
-    builder.git_global(true);
-    builder.git_exclude(true);
+    // Configure the builder to conditionally respect gitignore files
+    if !no_gitignore {
+        builder.git_ignore(true);
+        builder.git_global(true);
+        builder.git_exclude(true);
+    } else {
+        builder.git_ignore(false);
+        builder.git_global(false);
+        builder.git_exclude(false);
+        if debug_mode {
+            println!("DEBUG: Gitignore disabled - will not respect .gitignore files");
+        }
+    }
 
     // Enable parallel walking for large directories
     builder.threads(rayon::current_num_threads());
@@ -245,8 +274,8 @@ fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) ->
 
     // Add all ignore patterns to the override builder
     for pattern in &common_ignores {
-        if let Err(err) = override_builder.add(&format!("!**/{}", pattern)) {
-            eprintln!("Error adding ignore pattern {:?}: {}", pattern, err);
+        if let Err(err) = override_builder.add(&format!("!{pattern}")) {
+            eprintln!("Error adding ignore pattern {pattern:?}: {err}");
         }
     }
 
@@ -256,7 +285,7 @@ fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) ->
             builder.overrides(overrides);
         }
         Err(err) => {
-            eprintln!("Error building ignore overrides: {}", err);
+            eprintln!("Error building ignore overrides: {err}");
         }
     }
 
@@ -279,7 +308,7 @@ fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) ->
         let entry = match result {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("Error walking directory: {}", err);
+                eprintln!("Error walking directory: {err}");
                 continue;
             }
         };
@@ -292,11 +321,15 @@ fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) ->
         files.push(entry.path().to_path_buf());
     }
 
+    // Sort files for deterministic ordering to fix non-deterministic behavior
+    // This ensures that file discovery is consistent across runs
+    files.sort();
+
     let walk_duration = walk_start.elapsed();
 
     if debug_mode {
         println!(
-            "DEBUG: Directory walk completed in {} - Found {} files out of {} entries",
+            "DEBUG: Directory walk completed in {} - Found {} files out of {} entries (sorted for determinism)",
             format_duration(walk_duration),
             files.len(),
             total_files
@@ -320,6 +353,7 @@ fn build_file_list(path: &Path, allow_tests: bool, custom_ignores: &[String]) ->
 
 /// Find files whose names match query words
 /// Returns a map of file paths to the term indices that matched the filename
+#[allow(clippy::too_many_arguments)]
 pub fn find_matching_filenames(
     path: &Path,
     queries: &[String],
@@ -328,22 +362,24 @@ pub fn find_matching_filenames(
     allow_tests: bool,
     term_indices: &HashMap<String, usize>,
     language: Option<&str>,
+    no_gitignore: bool,
 ) -> Result<HashMap<PathBuf, HashSet<usize>>> {
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
         println!("DEBUG: Finding files with matching filenames");
-        println!("DEBUG: Queries: {:?}", queries);
+        println!("DEBUG: Queries: {queries:?}");
         println!(
             "DEBUG: Already found files count: {}",
             already_found_files.len()
         );
-        println!("DEBUG: Term indices: {:?}", term_indices);
+        println!("DEBUG: Term indices: {term_indices:?}");
     }
 
     // Get the cached file list, with language filtering if specified
-    let file_list = get_file_list_by_language(path, allow_tests, custom_ignores, language)?;
+    let file_list =
+        get_file_list_by_language(path, allow_tests, custom_ignores, language, no_gitignore)?;
 
     if debug_mode {
         println!(
@@ -359,10 +395,7 @@ pub fn find_matching_filenames(
         .collect();
 
     if debug_mode {
-        println!(
-            "DEBUG: Query tokens for filename matching: {:?}",
-            query_tokens
-        );
+        println!("DEBUG: Query tokens for filename matching: {query_tokens:?}");
     }
 
     // Search each file for matching filenames
@@ -381,10 +414,7 @@ pub fn find_matching_filenames(
         let filename_tokens = tokenization::tokenize(&relative_path);
 
         if debug_mode && !filename_tokens.is_empty() {
-            println!(
-                "DEBUG: Path '{}' tokenized as: {:?}",
-                relative_path, filename_tokens
-            );
+            println!("DEBUG: Path '{relative_path}' tokenized as: {filename_tokens:?}");
         }
         // Find which terms match the filename
         let mut matched_terms = HashSet::new();
@@ -403,8 +433,7 @@ pub fn find_matching_filenames(
                 matched_terms.insert(idx);
                 if debug_mode {
                     println!(
-                        "DEBUG: Term '{}' matched path '{}', adding index {}",
-                        term, relative_path, idx
+                        "DEBUG: Term '{term}' matched path '{relative_path}', adding index {idx}"
                     );
                 }
             }
@@ -461,30 +490,28 @@ pub fn get_file_list_by_language(
     allow_tests: bool,
     custom_ignores: &[String],
     language: Option<&str>,
+    no_gitignore: bool,
 ) -> Result<Arc<FileList>> {
     // If no language is specified, use the regular get_file_list function
     if language.is_none() {
-        return get_file_list(path, allow_tests, custom_ignores);
+        return get_file_list(path, allow_tests, custom_ignores, no_gitignore);
     }
 
     let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
-        println!(
-            "DEBUG: Getting file list for path: {:?} with language filter: {:?}",
-            path, language
-        );
+        println!("DEBUG: Getting file list for path: {path:?} with language filter: {language:?}");
     }
 
     // Get the full file list first
-    let full_file_list = get_file_list(path, allow_tests, custom_ignores)?;
+    let full_file_list = get_file_list(path, allow_tests, custom_ignores, no_gitignore)?;
 
     // Get the extensions for the specified language
     let extensions = get_language_extensions(language.unwrap());
 
     if debug_mode {
-        println!("DEBUG: Filtering files by extensions: {:?}", extensions);
+        println!("DEBUG: Filtering files by extensions: {extensions:?}");
     }
 
     // Filter the files by extension
@@ -497,7 +524,8 @@ pub fn get_file_list_by_language(
             .iter()
             .filter(|file| {
                 if let Some(ext) = file.extension() {
-                    let ext_str = format!(".{}", ext.to_string_lossy());
+                    let ext_lossy = ext.to_string_lossy();
+                    let ext_str = format!(".{ext_lossy}");
                     extensions.iter().any(|e| e == &ext_str)
                 } else {
                     false
@@ -522,4 +550,290 @@ pub fn get_file_list_by_language(
         files: filtered_files,
         created_at: Instant::now(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_underscore_directory_traversal_unix_paths() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create directory structure with underscores (Unix-style paths)
+        let underscore_dir = temp_dir.path().join("docs_packages").join("hello_kitty");
+        fs::create_dir_all(&underscore_dir).unwrap();
+
+        let test_file = underscore_dir.join("test.txt");
+        fs::write(&test_file, "test content with search term").unwrap();
+
+        // Also create a file in the parent underscore directory
+        let parent_file = temp_dir.path().join("docs_packages").join("parent.txt");
+        fs::write(&parent_file, "parent content").unwrap();
+
+        let file_list = get_file_list(temp_dir.path(), true, &[], false).unwrap();
+
+        assert!(
+            file_list.files.iter().any(|f| f == &test_file),
+            "File in nested underscore directory should be found: {test_file:?}"
+        );
+        assert!(
+            file_list.files.iter().any(|f| f == &parent_file),
+            "File in underscore directory should be found: {parent_file:?}"
+        );
+    }
+
+    #[test]
+    fn test_underscore_directory_traversal_windows_style_paths() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create directory structure similar to Windows paths with underscores
+        let underscore_dir = temp_dir
+            .path()
+            .join("C_drive")
+            .join("_ai")
+            .join("docs")
+            .join("docs_packages")
+            .join("helloKitty");
+        fs::create_dir_all(&underscore_dir).unwrap();
+
+        let test_file = underscore_dir.join("dog.txt");
+        fs::write(&test_file, "bad kitty > dog.txt").unwrap();
+
+        // Create additional test files in various underscore directories
+        let ai_dir_file = temp_dir
+            .path()
+            .join("C_drive")
+            .join("_ai")
+            .join("config.txt");
+        fs::create_dir_all(ai_dir_file.parent().unwrap()).unwrap();
+        fs::write(&ai_dir_file, "ai configuration").unwrap();
+
+        let docs_packages_file = temp_dir
+            .path()
+            .join("C_drive")
+            .join("_ai")
+            .join("docs")
+            .join("docs_packages")
+            .join("readme.md");
+        fs::create_dir_all(docs_packages_file.parent().unwrap()).unwrap();
+        fs::write(&docs_packages_file, "documentation packages").unwrap();
+
+        let file_list = get_file_list(temp_dir.path(), true, &[], false).unwrap();
+
+        assert!(
+            file_list.files.iter().any(|f| f == &test_file),
+            "File in deeply nested underscore directory should be found: {test_file:?}"
+        );
+        assert!(
+            file_list.files.iter().any(|f| f == &ai_dir_file),
+            "File in _ai directory should be found: {ai_dir_file:?}"
+        );
+        assert!(
+            file_list.files.iter().any(|f| f == &docs_packages_file),
+            "File in docs_packages directory should be found: {docs_packages_file:?}"
+        );
+    }
+
+    #[test]
+    fn test_underscore_directory_with_custom_ignores() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create directory structure with underscores
+        let underscore_dir = temp_dir.path().join("test_packages").join("sub_dir");
+        fs::create_dir_all(&underscore_dir).unwrap();
+
+        let test_file = underscore_dir.join("test.rs");
+        fs::write(&test_file, "fn test() {}").unwrap();
+
+        let ignored_file = underscore_dir.join("ignored.tmp");
+        fs::write(&ignored_file, "temporary content").unwrap();
+
+        // Test with custom ignore patterns
+        let custom_ignores = vec!["*.tmp".to_string()];
+        let file_list = get_file_list(temp_dir.path(), true, &custom_ignores, false).unwrap();
+
+        assert!(
+            file_list.files.iter().any(|f| f == &test_file),
+            "Rust file in underscore directory should be found: {test_file:?}"
+        );
+        assert!(
+            !file_list.files.iter().any(|f| f == &ignored_file),
+            "Ignored file should not be found: {ignored_file:?}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_underscore_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create various underscore directory patterns
+        let patterns = vec![
+            "single_underscore",
+            "multiple_under_scores",
+            "_leading_underscore",
+            "trailing_underscore_",
+            "__double__underscore__",
+            "mixed-dash_underscore",
+        ];
+
+        let mut expected_files = Vec::new();
+
+        for pattern in patterns {
+            let dir = temp_dir.path().join(pattern);
+            fs::create_dir_all(&dir).unwrap();
+
+            let file = dir.join("content.txt");
+            fs::write(&file, format!("content in {pattern}")).unwrap();
+            expected_files.push(file);
+        }
+
+        let file_list = get_file_list(temp_dir.path(), true, &[], false).unwrap();
+
+        for expected_file in &expected_files {
+            assert!(
+                file_list.files.iter().any(|f| f == expected_file),
+                "File in underscore directory should be found: {expected_file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_underscore_directories_respect_gitignore_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create underscore directories that should be ignored by common patterns
+        let node_modules_dir = temp_dir.path().join("project_dir").join("node_modules");
+        fs::create_dir_all(&node_modules_dir).unwrap();
+        let node_file = node_modules_dir.join("package.js");
+        fs::write(&node_file, "module content").unwrap();
+
+        let target_dir = temp_dir.path().join("rust_project").join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        let target_file = target_dir.join("binary");
+        fs::write(&target_file, "binary content").unwrap();
+
+        // Create underscore directories that should NOT be ignored
+        let valid_dir = temp_dir.path().join("valid_project").join("src_files");
+        fs::create_dir_all(&valid_dir).unwrap();
+        let valid_file = valid_dir.join("main.rs");
+        fs::write(&valid_file, "fn main() {}").unwrap();
+
+        let file_list = get_file_list(temp_dir.path(), true, &[], false).unwrap();
+
+        assert!(
+            !file_list.files.iter().any(|f| f == &node_file),
+            "Files in node_modules should be ignored: {node_file:?}"
+        );
+        assert!(
+            !file_list.files.iter().any(|f| f == &target_file),
+            "Files in target directory should be ignored: {target_file:?}"
+        );
+
+        assert!(
+            file_list.files.iter().any(|f| f == &valid_file),
+            "Files in valid underscore directories should be found: {valid_file:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_gitignore_parameter() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo to make .gitignore work with the ignore crate
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to initialize git repo");
+
+        // Create a .gitignore file
+        let gitignore_content = "*.ignored\nignored_dir/\n";
+        fs::write(temp_dir.path().join(".gitignore"), gitignore_content).unwrap();
+
+        // Create files that would normally be ignored by .gitignore
+        let ignored_file = temp_dir.path().join("test.ignored");
+        fs::write(&ignored_file, "ignored content").unwrap();
+
+        let ignored_dir = temp_dir.path().join("ignored_dir");
+        fs::create_dir_all(&ignored_dir).unwrap();
+        let ignored_dir_file = ignored_dir.join("file.txt");
+        fs::write(&ignored_dir_file, "file in ignored directory").unwrap();
+
+        // Create a regular file that should always be found
+        let regular_file = temp_dir.path().join("regular.txt");
+        fs::write(&regular_file, "regular content").unwrap();
+
+        // Test with gitignore enabled (default behavior)
+        let file_list_with_gitignore = get_file_list(temp_dir.path(), true, &[], false).unwrap();
+
+        assert!(
+            file_list_with_gitignore
+                .files
+                .iter()
+                .any(|f| f == &regular_file),
+            "Regular file should be found with gitignore enabled: {regular_file:?}"
+        );
+        assert!(
+            !file_list_with_gitignore
+                .files
+                .iter()
+                .any(|f| f == &ignored_file),
+            "Ignored file should not be found with gitignore enabled: {ignored_file:?}"
+        );
+        assert!(
+            !file_list_with_gitignore.files.iter().any(|f| f == &ignored_dir_file),
+            "File in ignored directory should not be found with gitignore enabled: {ignored_dir_file:?}"
+        );
+
+        // Test with gitignore disabled (no_gitignore = true)
+        let file_list_no_gitignore = get_file_list(temp_dir.path(), true, &[], true).unwrap();
+
+        assert!(
+            file_list_no_gitignore
+                .files
+                .iter()
+                .any(|f| f == &regular_file),
+            "Regular file should be found with gitignore disabled: {regular_file:?}"
+        );
+        assert!(
+            file_list_no_gitignore
+                .files
+                .iter()
+                .any(|f| f == &ignored_file),
+            "Ignored file should be found with gitignore disabled: {ignored_file:?}"
+        );
+        assert!(
+            file_list_no_gitignore.files.iter().any(|f| f == &ignored_dir_file),
+            "File in ignored directory should be found with gitignore disabled: {ignored_dir_file:?}"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_includes_no_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_path = temp_dir.path();
+
+        // Generate cache keys with different no_gitignore values
+        let key_with_gitignore = generate_cache_key(test_path, true, &[], false);
+        let key_without_gitignore = generate_cache_key(test_path, true, &[], true);
+
+        // The keys should be different
+        assert_ne!(
+            key_with_gitignore, key_without_gitignore,
+            "Cache keys should differ when no_gitignore parameter differs"
+        );
+
+        // Both keys should contain the appropriate gitignore string
+        assert!(
+            key_with_gitignore.contains("with_gitignore"),
+            "Cache key should contain 'with_gitignore' when no_gitignore is false"
+        );
+        assert!(
+            key_without_gitignore.contains("no_gitignore"),
+            "Cache key should contain 'no_gitignore' when no_gitignore is true"
+        );
+    }
 }
