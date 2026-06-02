@@ -115,6 +115,12 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
+      # Install zip on Windows
+      - name: Install zip on Windows
+        if: runner.os == 'Windows'
+        run: |
+          choco install zip -y
+
       # Package the binary into an archive
       - name: Package Binary
         shell: bash
@@ -141,8 +147,7 @@ jobs:
             tar -czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
             echo "ASSET=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
           elif [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            # Use PowerShell's built-in Compress-Archive (Windows native, no third-party tools needed)
-            powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip'"
+            zip -r "${ARCHIVE_NAME}.zip" "${ARCHIVE_NAME}"
             echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
           fi
 
@@ -241,16 +246,7 @@ jobs:
             tar -tzf "$ARCHIVE"
             tar -xzf "$ARCHIVE" -C "$PKG_DIR" --strip-components=1 "$(tar -tzf "$ARCHIVE" | grep "/$BIN_NAME$")"
           elif [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-            # List archive contents for debugging
-            unzip -Z1 "$ARCHIVE"
-            # Find the binary path inside the archive (normalize backslashes to forward slashes)
-            FILE_PATH=$(unzip -Z1 "$ARCHIVE" | grep -i "$BIN_NAME$" | head -1 | tr '\\' '/')
-            if [ -z "$FILE_PATH" ]; then
-              echo "ERROR: Could not find $BIN_NAME in archive"
-              exit 1
-            fi
-            echo "Extracting: $FILE_PATH"
-            unzip -j "$ARCHIVE" "$FILE_PATH" -d "$PKG_DIR"
+            unzip -j "$ARCHIVE" "$(unzip -Z1 "$ARCHIVE" | grep "/$BIN_NAME$")" -d "$PKG_DIR"
           fi
 
           # Copy documentation
