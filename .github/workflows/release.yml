@@ -240,7 +240,16 @@ jobs:
             tar -tzf "$ARCHIVE"
             tar -xzf "$ARCHIVE" -C "$PKG_DIR" --strip-components=1 "$(tar -tzf "$ARCHIVE" | grep "/$BIN_NAME$")"
           elif [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-            unzip -j "$ARCHIVE" "$(unzip -Z1 "$ARCHIVE" | grep "/$BIN_NAME$")" -d "$PKG_DIR"
+            # List archive contents for debugging
+            unzip -Z1 "$ARCHIVE"
+            # Find the binary path inside the archive
+            FILE_PATH=$(unzip -Z1 "$ARCHIVE" | grep -i "$BIN_NAME$" | head -1)
+            if [ -z "$FILE_PATH" ]; then
+              echo "ERROR: Could not find $BIN_NAME in archive"
+              exit 1
+            fi
+            echo "Extracting: $FILE_PATH"
+            unzip -j "$ARCHIVE" "$FILE_PATH" -d "$PKG_DIR"
           fi
 
           # Copy documentation
@@ -261,9 +270,9 @@ jobs:
           export node_arch="${{ matrix.node_cpu }}"
           envsubst < npm-release/package.json.tmpl > "$PKG_DIR/package.json"
 
-          # Publish
+          # Publish (use --tag for prerelease versions as npm requires)
           cd "$PKG_DIR"
-          npm publish --access public --provenance
+          npm publish --access public --provenance --tag latest
 
   # Publish meta npm package (after all target packages)
   publish-meta-package:
@@ -298,4 +307,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish --access public --provenance
+          npm publish --access public --provenance --tag latest
