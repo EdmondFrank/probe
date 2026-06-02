@@ -224,6 +224,7 @@ jobs:
       - name: Extract binary and publish
         shell: bash
         env:
+          NPM_CONFIG_PROVENANCE: true
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Find the archive
@@ -242,8 +243,8 @@ jobs:
           elif [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
             # List archive contents for debugging
             unzip -Z1 "$ARCHIVE"
-            # Find the binary path inside the archive
-            FILE_PATH=$(unzip -Z1 "$ARCHIVE" | grep -i "$BIN_NAME$" | head -1)
+            # Find the binary path inside the archive (normalize backslashes to forward slashes)
+            FILE_PATH=$(unzip -Z1 "$ARCHIVE" | grep -i "$BIN_NAME$" | head -1 | tr '\\' '/')
             if [ -z "$FILE_PATH" ]; then
               echo "ERROR: Could not find $BIN_NAME in archive"
               exit 1
@@ -305,6 +306,7 @@ jobs:
       - name: Publish meta-package
         shell: bash
         env:
+          NPM_CONFIG_PROVENANCE: true
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm publish --access public --provenance --tag latest
