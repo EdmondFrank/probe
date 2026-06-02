@@ -135,7 +135,6 @@ jobs:
           # Copy documentation and license files
           cp README.md "${ARCHIVE_NAME}/" || true
           cp LICENSE "${ARCHIVE_NAME}/" || true
-          cp ABOUT.MD "${ARCHIVE_NAME}/" || true
 
           # Create archive
           if [ "${{ matrix.archive_ext }}" = "tar.gz" ]; then
@@ -195,7 +194,6 @@ jobs:
           cp "${{ env.CHECKSUM }}" "$PKG_DIR/" || true
           cp README.md "$PKG_DIR/" || true
           cp LICENSE "$PKG_DIR/" || true
-          cp ABOUT.MD "$PKG_DIR/" || true
 
       - name: Generate package.json from template
         shell: bash
