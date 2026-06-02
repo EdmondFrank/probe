@@ -154,118 +154,134 @@ jobs:
           fi
           echo "CHECKSUM=${ARCHIVE_NAME}.${{ matrix.archive_ext }}.sha256" >> "$GITHUB_ENV"
 
-      # Upload the binary as a release asset
-      # - name: Release
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     files: |
-      #       ${{ env.ASSET }}
-      #       ${{ env.CHECKSUM }}
-      #     generate_release_notes: true
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GIT_TOKEN }}
+      # Upload artifact for npm packaging and release
+      - name: Upload artifact for npm packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
 
-      # --- NPM Package Preparation and Publish ---
+      # Upload checksum for release
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksum-${{ matrix.target }}
+          path: ${{ env.CHECKSUM }}
+          retention-days: 1
 
-      - name: Set up Node.js
+  # Publish per-target npm packages
+  publish-target-packages:
+    name: Publish ${{ matrix.target }} to npm
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            node_os: linux
+            node_cpu: x64
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: aarch64-unknown-linux-gnu
+            node_os: linux
+            node_cpu: arm64
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: x86_64-apple-darwin
+            node_os: darwin
+            node_cpu: x64
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: aarch64-apple-darwin
+            node_os: darwin
+            node_cpu: arm64
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: x86_64-pc-windows-msvc
+            node_os: win32
+            node_cpu: x64
+            archive_ext: zip
+            binary_ext: ".exe"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: 'https://registry.npmjs.org/'
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
           scope: "@edmondfrank"
-          token: ${{ secrets.NPM_TOKEN }} # Let setup-node handle authentication
 
-      - name: Prepare npm package directory
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: artifacts
+
+      - name: Extract binary and publish
         shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # Find the archive
+          ARCHIVE=$(find artifacts -name "*.${{ matrix.archive_ext }}" | head -1)
+          echo "Found archive: $ARCHIVE"
+
+          # Create package directory
           PKG_DIR="npm-release/${{ matrix.target }}"
           mkdir -p "$PKG_DIR"
-          # Extract the binary from the archive into the package root as probe or probe.exe
-          ARCHIVE="${{ env.ASSET }}"
+
+          # Extract binary
           BIN_NAME="probe${{ matrix.binary_ext }}"
           if [[ "${{ matrix.archive_ext }}" == "tar.gz" ]]; then
-            # List archive contents for debugging
             tar -tzf "$ARCHIVE"
-            # Extract the binary (no wildcards, use direct path)
             tar -xzf "$ARCHIVE" -C "$PKG_DIR" --strip-components=1 "$(tar -tzf "$ARCHIVE" | grep "/$BIN_NAME$")"
           elif [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
             unzip -j "$ARCHIVE" "$(unzip -Z1 "$ARCHIVE" | grep "/$BIN_NAME$")" -d "$PKG_DIR"
           fi
-          cp "${{ env.CHECKSUM }}" "$PKG_DIR/" || true
+
+          # Copy documentation
           cp README.md "$PKG_DIR/" || true
           cp LICENSE "$PKG_DIR/" || true
 
-      - name: Generate package.json from template
-        shell: bash
-        run: |
-          PKG_DIR="npm-release/${{ matrix.target }}"
-          # Determine version from tag or workflow_dispatch input
+          # Determine version
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
             VERSION="${{ github.event.inputs.tag }}"
           else
             VERSION="${GITHUB_REF#refs/tags/}"
           fi
-          # Map Rust target triples to npm os/cpu
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-gnu)
-              NODE_OS="linux"
-              NODE_CPU="x64"
-              ;;
-            aarch64-unknown-linux-gnu)
-              NODE_OS="linux"
-              NODE_CPU="arm64"
-              ;;
-            x86_64-apple-darwin)
-              NODE_OS="darwin"
-              NODE_CPU="x64"
-              ;;
-            aarch64-apple-darwin)
-              NODE_OS="darwin"
-              NODE_CPU="arm64"
-              ;;
-            x86_64-pc-windows-msvc)
-              NODE_OS="win32"
-              NODE_CPU="x64"
-              ;;
-            *)
-              echo "Unknown target: ${{ matrix.target }}"
-              exit 1
-              ;;
-          esac
 
-          # Use envsubst to fill in the template
-          export node_pkg="@edmondfrank/probe-${NODE_OS}-${NODE_CPU}"
+          # Generate package.json from template
+          export node_pkg="@edmondfrank/probe-${{ matrix.node_os }}-${{ matrix.node_cpu }}"
           export version="${VERSION#v}"
-          export node_os="${NODE_OS}"
-          export node_arch="${NODE_CPU}"
+          export node_os="${{ matrix.node_os }}"
+          export node_arch="${{ matrix.node_cpu }}"
           envsubst < npm-release/package.json.tmpl > "$PKG_DIR/package.json"
 
-      - name: Publish to npm
-        shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          PKG_DIR="npm-release/${{ matrix.target }}"
+          # Publish
           cd "$PKG_DIR"
-          npm publish --access public
+          npm publish --access public --provenance
 
+  # Publish meta npm package (after all target packages)
   publish-meta-package:
     name: Publish Meta NPM Package
+    needs: publish-target-packages
     runs-on: ubuntu-latest
-    needs: build-and-release
     if: |
       startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: 'https://registry.npmjs.org/'
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
           scope: "@edmondfrank"
-          token: ${{ secrets.NPM_TOKEN }} # Let setup-node handle authentication
 
       - name: Generate meta-package package.json
         run: |
@@ -278,7 +294,8 @@ jobs:
           mv package.json.out package.json
 
       - name: Publish meta-package
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish --access public
+          npm publish --access public --provenance
