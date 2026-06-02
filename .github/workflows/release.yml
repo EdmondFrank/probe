@@ -229,7 +229,6 @@ jobs:
       - name: Extract binary and publish
         shell: bash
         env:
-          NPM_CONFIG_PROVENANCE: true
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Find the archive
@@ -269,7 +268,7 @@ jobs:
 
           # Publish (use --tag for prerelease versions as npm requires)
           cd "$PKG_DIR"
-          npm publish --access public --provenance --tag latest
+          npm publish --access public --tag latest
 
   # Publish meta npm package (after all target packages)
   publish-meta-package:
@@ -302,7 +301,6 @@ jobs:
       - name: Publish meta-package
         shell: bash
         env:
-          NPM_CONFIG_PROVENANCE: true
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish --access public --provenance --tag latest
+          npm publish --access public --tag latest
