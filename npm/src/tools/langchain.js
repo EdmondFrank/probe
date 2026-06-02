@@ -6,25 +6,30 @@
 import { search } from '../search.js';
 import { query } from '../query.js';
 import { extract } from '../extract.js';
-import { searchSchema, querySchema, extractSchema, searchDescription, queryDescription, extractDescription } from './common.js';
+import { searchSchema, querySchema, extractSchema, searchDescription, queryDescription, extractDescription, parseTargets } from './common.js';
 
 // LangChain tool for searching code
-export function createSearchTool() {
+export function createSearchTool(options = {}) {
+	const { cwd } = options;
+
 	return {
 		name: 'search',
 		description: searchDescription,
 		schema: searchSchema,
-		func: async ({ query: searchQuery, path, allow_tests, exact, maxResults, maxTokens = 10000, language }) => {
+		func: async ({ query: searchQuery, path, allow_tests, exact, maxResults, maxTokens = 20000, language, session, nextPage }) => {
 			try {
 				const results = await search({
 					query: searchQuery,
 					path,
-					allow_tests,
+					cwd, // Working directory for resolving relative paths
+					allowTests: allow_tests ?? true,
 					exact,
 					json: false,
 					maxResults,
 					maxTokens,
-					language
+					language,
+					session,
+					nextPage
 				});
 
 				return results;
@@ -37,7 +42,9 @@ export function createSearchTool() {
 }
 
 // LangChain tool for querying code
-export function createQueryTool() {
+export function createQueryTool(options = {}) {
+	const { cwd } = options;
+
 	return {
 		name: 'query',
 		description: queryDescription,
@@ -47,8 +54,9 @@ export function createQueryTool() {
 				const results = await query({
 					pattern,
 					path,
+					cwd, // Working directory for resolving relative paths
 					language,
-					allow_tests,
+					allowTests: allow_tests ?? true,
 					json: false
 				});
 
@@ -62,18 +70,22 @@ export function createQueryTool() {
 }
 
 // LangChain tool for extracting code
-export function createExtractTool() {
+export function createExtractTool(options = {}) {
+	const { cwd } = options;
+
 	return {
 		name: 'extract',
 		description: extractDescription,
 		schema: extractSchema,
-		func: async ({ file_path, line, end_line, allow_tests, context_lines, format }) => {
+		func: async ({ targets, line, end_line, allow_tests, context_lines, format }) => {
 			try {
-				const files = [file_path];
+				// Split targets on whitespace to support multiple targets in one call
+				const files = parseTargets(targets);
 
 				const results = await extract({
 					files,
-					allowTests: allow_tests,
+					cwd, // Working directory for resolving relative paths
+					allowTests: allow_tests ?? true,
 					contextLines: context_lines,
 					format
 				});

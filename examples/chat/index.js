@@ -24,7 +24,7 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import { ProbeChat } from './probeChat.js';
 import { TokenUsageDisplay } from './tokenUsageDisplay.js';
-import { DEFAULT_SYSTEM_MESSAGE } from '@buger/probe';
+import { DEFAULT_SYSTEM_MESSAGE } from '@probelabs/probe';
 
 /**
  * Main function that runs the Probe Chat CLI or web interface
@@ -58,23 +58,35 @@ export function main() {
     .option('-p, --port <port>', 'Port to run web server on (default: 8080)')
     .option('-m, --message <message>', 'Send a single message and exit (non-interactive mode)')
     .option('-s, --session-id <sessionId>', 'Specify a session ID for the chat (optional)')
+    .option('--images <urls>', 'Comma-separated list of image URLs to include in the message')
     .option('--json', 'Output the response as JSON in non-interactive mode')
     .option('--max-iterations <number>', 'Maximum number of tool iterations allowed (default: 30)')
-    .option('--prompt <value>', 'Use a custom prompt (values: architect, code-review, support, path to a file, or arbitrary string)')
-    .option('--allow-edit', 'Enable the implement tool for editing files')
-    .option('--implement-tool-backend <backend>', 'Choose implementation tool backend (aider, claude-code)')
-    .option('--implement-tool-timeout <ms>', 'Implementation tool timeout in milliseconds')
-    .option('--implement-tool-config <path>', 'Path to implementation tool configuration file')
-    .option('--implement-tool-list-backends', 'List available implementation tool backends')
-    .option('--implement-tool-backend-info <backend>', 'Show information about a specific implementation tool backend')
+    .option('--prompt <value>', 'Use a custom prompt (values: architect, code-review, code-review-template, support, path to a file, or arbitrary string)')
+    .option('--allow-edit', 'Enable editing files')
+    .option('--enable-bash', 'Enable bash command execution for system exploration')
+    .option('--bash-allow <patterns>', 'Additional bash command patterns to allow (comma-separated)')
+    .option('--bash-deny <patterns>', 'Additional bash command patterns to deny (comma-separated)')  
+    .option('--no-default-bash-allow', 'Disable default bash allow list (use only custom patterns)')
+    .option('--no-default-bash-deny', 'Disable default bash deny list (use only custom patterns)')
+    .option('--bash-timeout <ms>', 'Bash command timeout in milliseconds (default: 120000)')
+    .option('--bash-working-dir <path>', 'Default working directory for bash commands')
     .option('--trace-file [path]', 'Enable tracing to file (default: ./traces.jsonl)')
     .option('--trace-remote [endpoint]', 'Enable tracing to remote endpoint (default: http://localhost:4318/v1/traces)')
     .option('--trace-console', 'Enable tracing to console (for debugging)')
+    .option('--completion-prompt <prompt>', 'Custom prompt to run after attempt_completion for validation/review (can be a string or path to a file)')
+    .option('--architecture-file <name>', 'Architecture context filename to embed from repo root (defaults to AGENTS.md with CLAUDE.md fallback; ARCHITECTURE.md is always included when present)')
     .argument('[path]', 'Path to the codebase to search (overrides ALLOWED_FOLDERS)')
     .parse(process.argv);
 
   const options = program.opts();
   const pathArg = program.args[0];
+
+  // Parse image URLs if provided
+  let imageUrls = [];
+  if (options.images) {
+    imageUrls = options.images.split(',').map(url => url.trim()).filter(url => url.length > 0);
+    console.log(`Using ${imageUrls.length} image(s):`, imageUrls);
+  }
 
   // --- Logging Configuration ---
   const isPipedInput = process.env.PROBE_STDIN_PIPED === '1';
@@ -148,75 +160,10 @@ export function main() {
     logInfo(chalk.blue(`Setting maximum tool iterations to: ${maxIterations}`));
   }
 
-  // Handle --implement-tool-list-backends option
-  if (options.implementToolListBackends) {
-    (async () => {
-      const { listBackendNames, getBackendMetadata } = await import('./implement/backends/registry.js');
-      const backends = listBackendNames();
-      
-      console.log('\nAvailable implementation tool backends:');
-      for (const backend of backends) {
-        const metadata = getBackendMetadata(backend);
-        console.log(`\n  ${chalk.bold(backend)} - ${metadata.description}`);
-        console.log(`    Version: ${metadata.version}`);
-        console.log(`    Languages: ${metadata.capabilities.supportsLanguages.join(', ')}`);
-      }
-      process.exit(0);
-    })();
-  }
-
-  // Handle --implement-tool-backend-info option
-  if (options.implementToolBackendInfo) {
-    (async () => {
-      const { getBackendMetadata } = await import('./implement/backends/registry.js');
-      const metadata = getBackendMetadata(options.implementToolBackendInfo);
-      
-      if (!metadata) {
-        console.error(`Backend '${options.implementToolBackendInfo}' not found`);
-        process.exit(1);
-      }
-      
-      console.log(`\n${chalk.bold('Backend Information: ' + options.implementToolBackendInfo)}`);
-      console.log(`\nDescription: ${metadata.description}`);
-      console.log(`Version: ${metadata.version}`);
-      console.log(`\nCapabilities:`);
-      console.log(`  Languages: ${metadata.capabilities.supportsLanguages.join(', ')}`);
-      console.log(`  Streaming: ${metadata.capabilities.supportsStreaming ? '✓' : '✗'}`);
-      console.log(`  Direct File Edit: ${metadata.capabilities.supportsDirectFileEdit ? '✓' : '✗'}`);
-      console.log(`  Test Generation: ${metadata.capabilities.supportsTestGeneration ? '✓' : '✗'}`);
-      console.log(`  Plan Generation: ${metadata.capabilities.supportsPlanGeneration ? '✓' : '✗'}`);
-      console.log(`  Max Sessions: ${metadata.capabilities.maxConcurrentSessions}`);
-      console.log(`\nRequired Dependencies:`);
-      for (const dep of metadata.dependencies) {
-        console.log(`  - ${dep.name} (${dep.type}): ${dep.description}`);
-        if (dep.installCommand) {
-          console.log(`    Install: ${dep.installCommand}`);
-        }
-      }
-      process.exit(0);
-    })();
-  }
-
   // Set ALLOW_EDIT from command line if provided
   if (options.allowEdit) {
     process.env.ALLOW_EDIT = '1';
-    logInfo(chalk.blue(`Enabling implement tool with --allow-edit flag`));
-  }
-
-  // Set implementation tool backend options
-  if (options.implementToolBackend) {
-    process.env.IMPLEMENT_TOOL_BACKEND = options.implementToolBackend;
-    logInfo(chalk.blue(`Using implementation tool backend: ${options.implementToolBackend}`));
-  }
-  
-  if (options.implementToolTimeout) {
-    process.env.IMPLEMENT_TOOL_TIMEOUT = options.implementToolTimeout;
-    logInfo(chalk.blue(`Implementation tool timeout: ${options.implementToolTimeout}ms`));
-  }
-  
-  if (options.implementToolConfig) {
-    process.env.IMPLEMENT_TOOL_CONFIG_PATH = options.implementToolConfig;
-    logInfo(chalk.blue(`Using implementation tool config: ${options.implementToolConfig}`));
+    logInfo(chalk.blue(`Enabling edit mode with --allow-edit flag`));
   }
 
   // Set telemetry options from command line if provided
@@ -238,11 +185,32 @@ export function main() {
   }
 
 
+  // Handle completion prompt if provided
+  let completionPrompt = null;
+  if (options.completionPrompt) {
+    // Check if it's a file path
+    try {
+      const completionPromptPath = resolve(options.completionPrompt);
+      if (existsSync(completionPromptPath)) {
+        completionPrompt = readFileSync(completionPromptPath, 'utf8');
+        logInfo(chalk.blue(`Loaded completion prompt from file: ${completionPromptPath}`));
+      } else {
+        // Not an existing file, treat as a direct string prompt
+        completionPrompt = options.completionPrompt;
+        logInfo(chalk.blue(`Using completion prompt string`));
+      }
+    } catch (error) {
+      // If there's an error resolving the path, treat as a direct string prompt
+      completionPrompt = options.completionPrompt;
+      logInfo(chalk.blue(`Using completion prompt string`));
+    }
+  }
+
   // Handle custom prompt if provided
   let customPrompt = null;
   if (options.prompt) {
     // Check if it's one of the predefined prompts
-    const predefinedPrompts = ['architect', 'code-review', 'support', 'engineer'];
+    const predefinedPrompts = ['architect', 'code-review', 'code-review-template', 'support', 'engineer'];
     if (predefinedPrompts.includes(options.prompt)) {
       process.env.PROMPT_TYPE = options.prompt;
       logInfo(chalk.blue(`Using predefined prompt: ${options.prompt}`));
@@ -309,19 +277,78 @@ export function main() {
     process.env.PORT = options.port;
   }
 
-  // Check for API keys
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-  const openaiApiKey = process.env.OPENAI_API_KEY;
-  const googleApiKey = process.env.GOOGLE_API_KEY;
-  const hasApiKeys = !!(anthropicApiKey || openaiApiKey || googleApiKey);
+  // --- Bash Configuration Processing ---
+  let bashConfig = null;
+  if (options.enableBash) {
+    bashConfig = {};
+    
+    // Parse allow patterns
+    if (options.bashAllow) {
+      bashConfig.allow = options.bashAllow.split(',').map(p => p.trim()).filter(p => p.length > 0);
+      logInfo(chalk.blue(`Bash allow patterns: ${bashConfig.allow.join(', ')}`));
+    }
+    
+    // Parse deny patterns
+    if (options.bashDeny) {
+      bashConfig.deny = options.bashDeny.split(',').map(p => p.trim()).filter(p => p.length > 0);
+      logInfo(chalk.blue(`Bash deny patterns: ${bashConfig.deny.join(', ')}`));
+    }
+    
+    // Handle default list flags
+    if (options.defaultBashAllow === false) {
+      bashConfig.disableDefaultAllow = true;
+      logInfo(chalk.blue('Default bash allow list disabled'));
+    }
+    
+    if (options.defaultBashDeny === false) {
+      bashConfig.disableDefaultDeny = true;
+      logInfo(chalk.blue('Default bash deny list disabled'));
+    }
+    
+    // Parse timeout
+    if (options.bashTimeout) {
+      const timeout = parseInt(options.bashTimeout, 10);
+      if (isNaN(timeout) || timeout < 1000) {
+        logError(chalk.red('Bash timeout must be a number >= 1000 milliseconds'));
+        process.exit(1);
+      }
+      bashConfig.timeout = timeout;
+      logInfo(chalk.blue(`Bash timeout: ${timeout}ms`));
+    }
+    
+    // Set working directory
+    if (options.bashWorkingDir) {
+      if (!existsSync(options.bashWorkingDir)) {
+        logError(chalk.red(`Bash working directory does not exist: ${options.bashWorkingDir}`));
+        process.exit(1);
+      }
+      bashConfig.workingDirectory = realpathSync(options.bashWorkingDir);
+      logInfo(chalk.blue(`Bash working directory: ${bashConfig.workingDirectory}`));
+    }
+    
+    logInfo(chalk.green('Bash command execution enabled'));
+  }
+
+  // --- Web Mode (check before non-interactive to override) ---
+  if (options.web) {
+    // Note: API key / CLI availability is checked lazily in ProbeAgent.initialize()
+    // when the first chat message is sent. This allows fallback to Claude Code or Codex CLI.
+    import('./webServer.js')
+      .then(async module => {
+        const { startWebServer } = module;
+        logInfo(`Starting web server on port ${process.env.PORT || 8080}...`);
+        await startWebServer(version, { allowEdit: options.allowEdit });
+      })
+      .catch(error => {
+        logError(chalk.red(`Error starting web server: ${error.message}`));
+        process.exit(1);
+      });
+    return; // Exit main function
+  }
+  // --- End Web Mode ---
 
   // --- Non-Interactive Mode ---
   if (isNonInteractive) {
-    if (!hasApiKeys) {
-      logError(chalk.red('No API key provided. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY environment variable.'));
-      process.exit(1);
-    }
-
     let chat;
     try {
       // Pass session ID if provided, ProbeChat generates one otherwise
@@ -329,11 +356,13 @@ export function main() {
         sessionId: options.sessionId,
         isNonInteractive: true,
         customPrompt: customPrompt,
-        promptType: options.prompt && ['architect', 'code-review', 'support', 'engineer'].includes(options.prompt) ? options.prompt : null,
-        allowEdit: options.allowEdit
+        promptType: options.prompt && ['architect', 'code-review', 'code-review-template', 'support', 'engineer'].includes(options.prompt) ? options.prompt : null,
+        allowEdit: options.allowEdit,
+        architectureFileName: options.architectureFile,
+        enableBash: options.enableBash,
+        bashConfig: bashConfig,
+        completionPrompt: completionPrompt
       });
-      // Model/Provider info is logged via logInfo above if debug enabled
-      logInfo(chalk.blue(`Using Session ID: ${chat.getSessionId()}`)); // Log the actual session ID being used
     } catch (error) {
       logError(chalk.red(`Initializing chat failed: ${error.message}`));
       process.exit(1);
@@ -355,6 +384,19 @@ export function main() {
     // Async function to handle the single chat request
     const runNonInteractiveChat = async () => {
       try {
+        // Initialize the chat (handles API key validation, claude-code/codex fallback)
+        await chat.initialize();
+
+        // Validate provider after initialization
+        const providerInfo = chat.getProviderInfo();
+        if (providerInfo.provider === 'unknown' || providerInfo.provider === 'uninitialized') {
+          throw new Error('No valid AI provider available. Please set an API key or install claude/codex CLI.');
+        }
+
+        // Log provider info after successful initialization
+        logInfo(chalk.green(`Using provider: ${providerInfo.provider} with model: ${providerInfo.model}`));
+        logInfo(chalk.blue(`Using Session ID: ${chat.getSessionId()}`));
+
         // Get message from command line argument or stdin
         let message = options.message;
 
@@ -370,7 +412,7 @@ export function main() {
         }
 
         logInfo('Sending message...'); // Log only if debug
-        const result = await chat.chat(message, chat.getSessionId()); // Use the chat's current session ID
+        const result = await chat.chat(message, { images: imageUrls });
 
         if (result && typeof result === 'object' && result.response !== undefined) {
           if (options.json) {
@@ -417,40 +459,8 @@ export function main() {
   // --- End Non-Interactive Mode ---
 
 
-  // --- Web Mode ---
-  if (options.web) {
-    if (!hasApiKeys) {
-      // Use logWarn for web mode warning
-      logWarn(chalk.yellow('Warning: No API key provided. The web interface will show instructions on how to set up API keys.'));
-    }
-    // Import and start web server
-    import('./webServer.js')
-      .then(module => {
-        const { startWebServer } = module;
-        logInfo(`Starting web server on port ${process.env.PORT || 8080}...`);
-        startWebServer(version, hasApiKeys, { allowEdit: options.allowEdit });
-      })
-      .catch(error => {
-        logError(chalk.red(`Error starting web server: ${error.message}`));
-        process.exit(1);
-      });
-    return; // Exit main function
-  }
-  // --- End Web Mode ---
-
-
   // --- Interactive CLI Mode ---
   // (This block only runs if not non-interactive and not web mode)
-
-  if (!hasApiKeys) {
-    // Use logError and standard console.log for setup instructions
-    logError(chalk.red('No API key provided. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY environment variable.'));
-    console.log(chalk.cyan('You can find these instructions in the .env.example file:'));
-    console.log(chalk.cyan('1. Create a .env file by copying .env.example'));
-    console.log(chalk.cyan('2. Add your API key to the .env file'));
-    console.log(chalk.cyan('3. Restart the application'));
-    process.exit(1);
-  }
 
   // Initialize ProbeChat for CLI mode
   let chat;
@@ -460,27 +470,49 @@ export function main() {
       sessionId: options.sessionId,
       isNonInteractive: false,
       customPrompt: customPrompt,
-      promptType: options.prompt && ['architect', 'code-review', 'support', 'engineer'].includes(options.prompt) ? options.prompt : null,
-      allowEdit: options.allowEdit
+      promptType: options.prompt && ['architect', 'code-review', 'code-review-template', 'support', 'engineer'].includes(options.prompt) ? options.prompt : null,
+      allowEdit: options.allowEdit,
+      architectureFileName: options.architectureFile,
+      enableBash: options.enableBash,
+      bashConfig: bashConfig,
+      completionPrompt: completionPrompt
     });
-
-    // Log model/provider info using logInfo
-    if (chat.apiType === 'anthropic') {
-      logInfo(chalk.green(`Using Anthropic API with model: ${chat.model}`));
-    } else if (chat.apiType === 'openai') {
-      logInfo(chalk.green(`Using OpenAI API with model: ${chat.model}`));
-    } else if (chat.apiType === 'google') {
-      logInfo(chalk.green(`Using Google API with model: ${chat.model}`));
-    }
-
-    logInfo(chalk.blue(`Session ID: ${chat.getSessionId()}`));
-    logInfo(chalk.cyan('Type "exit" or "quit" to end the chat'));
-    logInfo(chalk.cyan('Type "usage" to see token usage statistics'));
-    logInfo(chalk.cyan('Type "clear" to clear the chat history'));
-    logInfo(chalk.cyan('-------------------------------------------'));
   } catch (error) {
-    logError(chalk.red(`Error initializing chat: ${error.message}`));
+    logError(chalk.red(`Error creating chat instance: ${error.message}`));
     process.exit(1);
+  }
+
+  // Async initialization wrapper for interactive mode
+  async function initializeAndStartChat() {
+    try {
+      // Initialize the chat (handles API key validation, claude-code/codex fallback)
+      await chat.initialize();
+
+      // Validate provider after initialization
+      const providerInfo = chat.getProviderInfo();
+      if (providerInfo.provider === 'unknown' || providerInfo.provider === 'uninitialized') {
+        throw new Error('No valid AI provider available. Please set an API key or install claude/codex CLI.');
+      }
+
+      // Log provider info after successful initialization
+      if (providerInfo.isCliProvider) {
+        logInfo(chalk.green(`Using ${providerInfo.provider} CLI`));
+      } else {
+        logInfo(chalk.green(`Using ${providerInfo.provider} API with model: ${providerInfo.model}`));
+      }
+
+      logInfo(chalk.blue(`Session ID: ${chat.getSessionId()}`));
+      logInfo(chalk.cyan('Type "exit" or "quit" to end the chat'));
+      logInfo(chalk.cyan('Type "usage" to see token usage statistics'));
+      logInfo(chalk.cyan('Type "clear" to clear the chat history'));
+      logInfo(chalk.cyan('-------------------------------------------'));
+
+      // Start the interactive chat loop
+      await runInteractiveChat();
+    } catch (error) {
+      logError(chalk.red(`Error initializing chat: ${error.message}`));
+      process.exit(1);
+    }
   }
 
   // Format AI response for interactive mode
@@ -504,7 +536,7 @@ export function main() {
   }
 
   // Main interactive chat loop
-  async function startChat() {
+  async function runInteractiveChat() {
     while (true) {
       const { message } = await inquirer.prompt([
         {
@@ -519,7 +551,7 @@ export function main() {
         logInfo(chalk.yellow('Goodbye!'));
         break;
       } else if (message.toLowerCase() === 'usage') {
-        const usage = chat.getTokenUsage();
+        const usage = chat.getUsageSummary();
         const display = new TokenUsageDisplay();
         const formatted = display.format(usage);
 
@@ -536,15 +568,15 @@ export function main() {
         process.stdout.write('\x1B]0;Context: ' + formatted.contextWindow + '\x07');
         continue;
       } else if (message.toLowerCase() === 'clear') {
-        const newSessionId = chat.clearHistory();
+        chat.clearHistory();
         logInfo(chalk.yellow('Chat history cleared'));
-        logInfo(chalk.blue(`New session ID: ${newSessionId}`));
+        logInfo(chalk.blue(`New session ID: ${chat.getSessionId()}`));
         continue;
       }
 
       const spinner = ora('Thinking...').start(); // Spinner is ok for interactive mode
       try {
-        const result = await chat.chat(message); // Uses internal session ID
+        const result = await chat.chat(message, { images: imageUrls });
         spinner.stop();
 
         logInfo(chalk.green('Assistant:'));
@@ -562,7 +594,7 @@ export function main() {
     }
   }
 
-  startChat().catch((error) => {
+  initializeAndStartChat().catch((error) => {
     logError(chalk.red(`Fatal error in interactive chat: ${error.message}`));
     process.exit(1);
   });

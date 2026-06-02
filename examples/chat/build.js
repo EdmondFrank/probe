@@ -35,7 +35,7 @@ async function buildApp() {
         '@ai-sdk/*', 
         'tiktoken',
         // Keep probe as external since it downloads binaries at runtime
-        '@buger/probe',
+        '@probelabs/probe',
         // These have dynamic require issues when bundled
         'dotenv',
         'inquirer',
@@ -79,8 +79,7 @@ async function buildApp() {
     // Copy directories that might be needed at runtime
     const staticDirs = [
       'bin',
-      'storage', 
-      'implement'
+      'storage'
     ];
 
     for (const dir of staticDirs) {

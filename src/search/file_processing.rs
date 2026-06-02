@@ -74,6 +74,7 @@ pub struct FileProcessingParams<'a> {
 
     #[allow(dead_code)]
     pub no_merge: bool,
+    pub lsp: bool,
 }
 
 /// Evaluate whether a block of lines satisfies a complex AST query
@@ -145,7 +146,7 @@ pub fn filter_code_block_with_ast(
     }
 
     // Check if we have any matches at all
-    if matched_terms.is_empty() && !plan.has_only_excluded_terms {
+    if matched_terms.is_empty() && !plan.has_only_excluded_terms && !plan.is_universal_query {
         if debug_mode {
             println!(
                 "DEBUG: No matched terms in block {}-{}, returning false",
@@ -153,6 +154,17 @@ pub fn filter_code_block_with_ast(
             );
         }
         return false;
+    }
+
+    // Universal query - accept all blocks
+    if plan.is_universal_query && matched_terms.is_empty() {
+        if debug_mode {
+            println!(
+                "DEBUG: Universal query - accepting block {}-{}",
+                block_lines.0, block_lines.1
+            );
+        }
+        return true;
     }
 
     // Use the AST evaluation directly
@@ -222,26 +234,23 @@ pub fn filter_tokenized_block(
 
         if !has_all_required {
             // Check for special cases in compound words
-            let missing_required: Vec<_> = plan
+            let missing_required: Vec<usize> = plan
                 .required_terms_indices
                 .iter()
                 .filter(|idx| !matched_terms.contains(idx))
+                .copied()
                 .collect();
 
             let mut check_special_cases = false;
-            for &idx in &missing_required {
-                // Find the term for this index
-                if let Some(term) = plan
-                    .term_indices
-                    .iter()
-                    .find(|(_, &i)| i == *idx)
-                    .map(|(t, _)| t)
-                {
-                    if crate::search::tokenization::is_special_case(term)
-                        && tokenized_content.contains(&term.to_lowercase())
-                    {
-                        matched_terms.insert(*idx);
-                        check_special_cases = true;
+            for idx in &missing_required {
+                // PHASE 5 OPTIMIZATION: Use pre-computed special case info
+                if plan.special_case_indices.contains(idx) {
+                    // Use pre-computed lowercase term for O(n) lookup (but avoid is_special_case call)
+                    if let Some(term_lower) = plan.special_case_terms_lower.get(idx) {
+                        if tokenized_content.iter().any(|t| t == term_lower) {
+                            matched_terms.insert(*idx);
+                            check_special_cases = true;
+                        }
                     }
                 }
             }
@@ -257,21 +266,28 @@ pub fn filter_tokenized_block(
         return true;
     }
 
-    // Special handling for compound words like "whitelist"
-    // Check if any term in the plan is a compound of tokens in the content
-    for (term, &idx) in &plan.term_indices {
+    // PHASE 5 OPTIMIZATION: Use pre-computed special case indices
+    // Skip the expensive is_special_case() calls by using pre-computed data
+    for &idx in &plan.special_case_indices {
         // Skip if we already matched this term
         if matched_terms.contains(&idx) {
             continue;
         }
 
-        // Check if this term is a special case that should be treated as a single token
-        if crate::search::tokenization::is_special_case(term) {
-            // If the tokenized content contains this special case term, add it to matched terms
-            if tokenized_content.contains(&term.to_lowercase()) {
+        // Use pre-computed lowercase term
+        if let Some(term_lower) = plan.special_case_terms_lower.get(&idx) {
+            if tokenized_content.iter().any(|t| t == term_lower) {
                 matched_terms.insert(idx);
                 if debug_mode {
-                    println!("DEBUG: Special case term '{term}' matched in tokenized content");
+                    // Find the original term for debug output
+                    if let Some(term) = plan
+                        .term_indices
+                        .iter()
+                        .find(|(_, &i)| i == idx)
+                        .map(|(t, _)| t)
+                    {
+                        println!("DEBUG: Special case term '{term}' matched in tokenized content");
+                    }
                 }
             }
         }
@@ -307,6 +323,13 @@ pub fn filter_tokenized_block(
     if matched_terms.is_empty() {
         // Check if the query only contains excluded terms
         if plan.has_only_excluded_terms {
+            return true;
+        }
+        // Check if this is a universal query (e.g., filename-only search)
+        if plan.is_universal_query {
+            if debug_mode {
+                println!("DEBUG: Universal query - accepting all blocks");
+            }
             return true;
         }
         if debug_mode {
@@ -819,24 +842,13 @@ fn process_uncovered_lines_batch(ctx: &mut BatchProcessingContext) {
                 );
             }
 
-            // Skip tokenization and evaluation when exact flag is enabled
-            if ctx.params.query_plan.exact {
-                // In exact mode, we already matched the lines in the file
-                // so we should include this block without re-evaluating
-                if ctx.debug_mode {
-                    println!(
-                        "DEBUG: Exact mode enabled, skipping tokenization and evaluation for merged fallback context {context_start}-{context_end}"
-                    );
-                }
-                true
-            } else {
-                filter_tokenized_block(
-                    &context_terms,
-                    &ctx.params.query_plan.term_indices,
-                    ctx.params.query_plan,
-                    ctx.debug_mode,
-                )
-            }
+            // Prefer AST/line-based evaluation using matched term lines for correctness
+            filter_code_block_with_ast(
+                (context_start, context_end),
+                ctx.params.term_matches,
+                ctx.params.query_plan,
+                ctx.debug_mode,
+            )
         };
 
         // We don't add this to any timing since filtering is not part of result building
@@ -918,12 +930,14 @@ fn process_uncovered_lines_batch(ctx: &mut BatchProcessingContext) {
 
             // BATCH OPTIMIZATION: Get matched term indices for the entire merged context block
             let mut matched_term_indices = HashSet::new();
+            let mut matched_line_numbers = HashSet::new();
             for (&term_idx, lines) in ctx.params.term_matches {
-                if lines
-                    .iter()
-                    .any(|&l| l >= context_start && l <= context_end)
-                {
-                    matched_term_indices.insert(term_idx);
+                for &line_num in lines {
+                    if line_num >= context_start && line_num <= context_end {
+                        matched_term_indices.insert(term_idx);
+                        // Store line number relative to result start (0-based)
+                        matched_line_numbers.insert(line_num - context_start);
+                    }
                 }
             }
 
@@ -951,12 +965,16 @@ fn process_uncovered_lines_batch(ctx: &mut BatchProcessingContext) {
             // Start measuring result creation time
             let result_creation_start = Instant::now();
 
+            // Symbol signature not used since symbols functionality was removed
+            let symbol_signature = None;
+
             // BATCH OPTIMIZATION: Create single result for merged context window instead of multiple individual results
             let result = SearchResult {
                 file: ctx.params.path.to_string_lossy().to_string(),
                 lines: (context_start, context_end),
                 node_type,
                 code: context_code,
+                symbol_signature,
                 matched_by_filename: None,
                 rank: None,
                 score: None,
@@ -979,7 +997,16 @@ fn process_uncovered_lines_batch(ctx: &mut BatchProcessingContext) {
                 } else {
                     Some(matched_keywords)
                 },
+                matched_lines: if matched_line_numbers.is_empty() {
+                    None
+                } else {
+                    let mut lines_vec: Vec<usize> = matched_line_numbers.into_iter().collect();
+                    lines_vec.sort();
+                    Some(lines_vec)
+                },
                 tokenized_content: Some(context_terms),
+                lsp_info: None,
+                parent_context: None,
             };
 
             // Add to result creation time
@@ -1084,7 +1111,7 @@ pub fn process_file_with_results(
         .unwrap_or("");
 
     // Get debug mode setting
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     // Filter out lines longer than 500 characters
     let lines: Vec<&str> = content
@@ -1329,41 +1356,28 @@ pub fn process_file_with_results(
 
                 // Start measuring filtering time
                 let filtering_start = Instant::now();
-                // Early filtering using tokenized content
+                // Early filtering using AST/line-based evaluation for correctness
                 let should_include = {
                     if debug_mode {
                         println!(
-                            "DEBUG: Using filter_tokenized_block for block {final_start_line}-{final_end_line}"
+                            "DEBUG: Using filter_code_block_with_ast for block {final_start_line}-{final_end_line}"
                         );
                     }
 
-                    // Skip tokenization and evaluation when exact flag is enabled
-                    if params.query_plan.exact {
-                        // In exact mode, we already matched the lines in the file
-                        // so we should include this block without re-evaluating
-                        if debug_mode {
-                            println!(
-                                "DEBUG: Exact mode enabled, skipping tokenization and evaluation for block {final_start_line}-{final_end_line}"
-                            );
-                        }
-                        true
-                    } else {
-                        // Use the AST evaluation directly to ensure correct handling of complex queries
-                        let result = filter_tokenized_block(
-                            &block_terms,
-                            &params.query_plan.term_indices,
-                            params.query_plan,
-                            debug_mode,
+                    let result = filter_code_block_with_ast(
+                        (final_start_line, final_end_line),
+                        &params.term_matches,
+                        params.query_plan,
+                        debug_mode,
+                    );
+
+                    if debug_mode {
+                        println!(
+                            "DEBUG: Block {final_start_line}-{final_end_line} filter result: {result}"
                         );
-
-                        if debug_mode {
-                            println!(
-                                "DEBUG: Block {final_start_line}-{final_end_line} filter result: {result}"
-                            );
-                        }
-
-                        result
                     }
+
+                    result
                 };
 
                 // End filtering time measurement
@@ -1457,14 +1471,16 @@ pub fn process_file_with_results(
                     // Start measuring line matching time
                     let line_matching_start = Instant::now();
 
-                    // Get the matched term indices for this block
+                    // Get the matched term indices and line numbers for this block
                     let mut matched_term_indices = HashSet::new();
+                    let mut matched_line_numbers = HashSet::new();
                     for (&term_idx, lines) in params.term_matches {
-                        if lines
-                            .iter()
-                            .any(|&l| l >= final_start_line && l <= final_end_line)
-                        {
-                            matched_term_indices.insert(term_idx);
+                        for &line_num in lines {
+                            if line_num >= final_start_line && line_num <= final_end_line {
+                                matched_term_indices.insert(term_idx);
+                                // Store line number relative to result start (0-based)
+                                matched_line_numbers.insert(line_num - final_start_line);
+                            }
                         }
                     }
 
@@ -1490,6 +1506,8 @@ pub fn process_file_with_results(
                     // Start measuring result creation time
                     let result_creation_start = Instant::now();
 
+                    // For now, we'll leave LSP info as None during initial processing
+                    // LSP info will be added in a post-processing step if enabled
                     let result = SearchResult {
                         file: params.path.to_string_lossy().to_string(),
                         lines: (final_start_line, final_end_line),
@@ -1502,6 +1520,7 @@ pub fn process_file_with_results(
                             block.node_type.clone()
                         },
                         code: full_code,
+                        symbol_signature: None,
                         matched_by_filename: None,
                         rank: None,
                         score: None,
@@ -1524,7 +1543,16 @@ pub fn process_file_with_results(
                         } else {
                             Some(matched_keywords)
                         },
+                        matched_lines: if matched_line_numbers.is_empty() {
+                            None
+                        } else {
+                            let mut lines_vec: Vec<usize> = matched_line_numbers.into_iter().collect();
+                            lines_vec.sort();
+                            Some(lines_vec)
+                        },
                         tokenized_content: Some(block_terms),
+                        lsp_info: None,
+                        parent_context: None,
                     };
 
                     let result_creation_duration_value = result_creation_start.elapsed();
@@ -1729,4 +1757,204 @@ pub fn process_file_with_results(
     }
 
     Ok((results, timings))
+}
+
+/// Helper function to extract symbol signature from a code block using the AST tree
+/// Returns the symbol signature if symbols mode is enabled and extraction succeeds
+fn extract_symbol_signature(
+    symbols_enabled: bool,
+    tree: Option<&tree_sitter::Tree>,
+    extension: &str,
+    source: &[u8],
+    start_byte: usize,
+    end_byte: usize,
+    debug_mode: bool,
+) -> Option<String> {
+    if !symbols_enabled {
+        return None;
+    }
+
+    let tree = tree?;
+    let language_impl = crate::language::factory::get_language_impl(extension)?;
+
+    if debug_mode {
+        println!("DEBUG: Extracting symbol signature for byte range {start_byte}-{end_byte}");
+    }
+
+    // Find the node at the given byte range
+    let root_node = tree.root_node();
+    find_node_and_extract_signature(
+        &root_node,
+        start_byte,
+        end_byte,
+        source,
+        &*language_impl,
+        debug_mode,
+    )
+}
+
+/// Helper function to extract symbol signature from code content directly
+/// This is used for fallback contexts where we don't have precise byte ranges
+#[allow(dead_code)]
+fn extract_symbol_signature_from_content(
+    extension: &str,
+    content: &str,
+    debug_mode: bool,
+) -> Option<String> {
+    let language_impl = crate::language::factory::get_language_impl(extension)?;
+
+    if debug_mode {
+        println!("DEBUG: Extracting symbol signature from content snippet");
+    }
+
+    // Try to parse the content as a standalone snippet
+    if let Ok(mut parser) = crate::language::get_pooled_parser(extension) {
+        if let Some(tree) = parser.parse(content, None) {
+            let root_node = tree.root_node();
+
+            // Look for the most significant node in the content
+            let signature = find_best_symbol_signature(
+                &root_node,
+                content.as_bytes(),
+                &*language_impl,
+                debug_mode,
+            );
+
+            // Return parser to pool
+            crate::language::return_pooled_parser(extension, parser);
+
+            signature
+        } else {
+            if debug_mode {
+                println!("DEBUG: Failed to parse content for symbol signature");
+            }
+            None
+        }
+    } else {
+        if debug_mode {
+            println!("DEBUG: Failed to get parser for symbol signature extraction");
+        }
+        None
+    }
+}
+
+/// Find the best symbol signature from a parsed tree by looking for significant nodes
+#[allow(dead_code)]
+fn find_best_symbol_signature(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    language_impl: &dyn crate::language::language_trait::LanguageImpl,
+    debug_mode: bool,
+) -> Option<String> {
+    // Try current node first
+    if let Some(signature) = language_impl.get_symbol_signature(node, source) {
+        if debug_mode {
+            println!(
+                "DEBUG: Found symbol signature for node type '{}': {}",
+                node.kind(),
+                signature
+            );
+        }
+        return Some(signature);
+    }
+
+    // If no signature for current node, try children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(signature) =
+            find_best_symbol_signature(&child, source, language_impl, debug_mode)
+        {
+            return Some(signature);
+        }
+    }
+
+    None
+}
+
+/// Helper function to find the most appropriate node within a byte range and extract its signature
+/// This avoids lifetime issues by directly extracting the signature instead of returning nodes
+fn find_node_and_extract_signature(
+    node: &tree_sitter::Node,
+    start_byte: usize,
+    end_byte: usize,
+    source: &[u8],
+    language_impl: &dyn crate::language::language_trait::LanguageImpl,
+    debug_mode: bool,
+) -> Option<String> {
+    // First, find the smallest node that completely contains the target range
+    let containing_node = find_smallest_containing_node(node, start_byte, end_byte)?;
+
+    // Then, traverse upward from that node to find a parent with symbol signature
+    find_symbol_signature_upward(&containing_node, source, language_impl, debug_mode)
+}
+
+/// Find the smallest node that completely contains the given byte range
+fn find_smallest_containing_node<'a>(
+    node: &tree_sitter::Node<'a>,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<tree_sitter::Node<'a>> {
+    // Check if current node contains the range
+    if node.start_byte() <= start_byte && node.end_byte() >= end_byte {
+        // Look for a smaller child node that also contains the range
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(smaller_node) = find_smallest_containing_node(&child, start_byte, end_byte)
+            {
+                return Some(smaller_node);
+            }
+        }
+        // No smaller child found, this node is the smallest container
+        Some(*node)
+    } else {
+        None
+    }
+}
+
+/// Traverse upward from a node to find the first parent (or self) with a symbol signature
+fn find_symbol_signature_upward(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    language_impl: &dyn crate::language::language_trait::LanguageImpl,
+    debug_mode: bool,
+) -> Option<String> {
+    let mut current_node = Some(*node);
+
+    while let Some(node) = current_node {
+        if debug_mode {
+            println!(
+                "DEBUG: Checking node of type '{}' for symbol signature (range {}-{})",
+                node.kind(),
+                node.start_byte(),
+                node.end_byte()
+            );
+        }
+
+        // Skip source_file nodes unless we're at the root
+        if node.kind() != "source_file" {
+            if let Some(signature) = language_impl.get_symbol_signature(&node, source) {
+                if debug_mode {
+                    println!(
+                        "DEBUG: Found symbol signature for node type '{}': {}",
+                        node.kind(),
+                        signature
+                    );
+                }
+                return Some(signature);
+            } else if debug_mode {
+                println!(
+                    "DEBUG: No symbol signature available for node type '{}'",
+                    node.kind()
+                );
+            }
+        }
+
+        // Move to parent
+        current_node = node.parent();
+    }
+
+    if debug_mode {
+        println!("DEBUG: No symbol signature found in any parent node");
+    }
+    None
 }

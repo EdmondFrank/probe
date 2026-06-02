@@ -21,7 +21,7 @@ echo "╚═══════════════════════�
 echo -e "${NC}"
 
 # GitHub repository information
-REPO_OWNER="buger"
+REPO_OWNER="probelabs"
 REPO_NAME="probe"
 BINARY_NAME="probe"
 INSTALL_DIR="/usr/local/bin"
@@ -54,7 +54,8 @@ detect_os_arch() {
   case "$OS" in
     Linux)
       OS_TYPE="linux"
-      OS_KEYWORDS=("linux" "Linux" "gnu")
+      # Accept both musl and gnu-named assets; prefer match by 'linux'
+      OS_KEYWORDS=("linux" "Linux" "musl" "gnu")
       ;;
     Darwin)
       OS_TYPE="darwin"

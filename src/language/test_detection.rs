@@ -2,14 +2,14 @@ use std::path::Path;
 
 /// Function to determine if a file is a test file based on common naming conventions and directory patterns
 pub fn is_test_file(path: &Path) -> bool {
-    let _debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let _debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     // Check file name patterns
     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
         // Rust: *_test.rs, *_tests.rs, test_*.rs, tests.rs
         if file_name.ends_with("_test.rs")
             || file_name.ends_with("_tests.rs")
-            || file_name.starts_with("test_")
+            || (file_name.starts_with("test_") && file_name.ends_with(".rs"))
             || file_name == "tests.rs"
         {
             if _debug_mode {
@@ -93,12 +93,31 @@ pub fn is_test_file(path: &Path) -> bool {
             return true;
         }
 
+        // Crystal: spec files conventionally use *_spec.cr
+        if file_name.ends_with("_spec.cr") {
+            if _debug_mode {
+                println!("DEBUG: Test file detected (Crystal pattern): {file_name}");
+            }
+            return true;
+        }
+
         // PHP: *Test.php, Test*.php
         if file_name.ends_with("Test.php")
             || file_name.starts_with("Test") && file_name.ends_with(".php")
         {
             if _debug_mode {
                 println!("DEBUG: Test file detected (PHP pattern): {file_name}");
+            }
+            return true;
+        }
+
+        // Solidity/Foundry: *.t.sol, *Test.sol, Test*.sol
+        if file_name.ends_with(".t.sol")
+            || file_name.ends_with("Test.sol")
+            || file_name.starts_with("Test") && file_name.ends_with(".sol")
+        {
+            if _debug_mode {
+                println!("DEBUG: Test file detected (Solidity pattern): {file_name}");
             }
             return true;
         }

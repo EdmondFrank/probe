@@ -1,4 +1,5 @@
 use clap::{Parser as ClapParser, Subcommand};
+use probe_code::lsp_integration::LspSubcommands;
 use std::path::PathBuf;
 
 #[derive(ClapParser, Debug)]
@@ -31,7 +32,7 @@ pub struct Args {
     #[arg(short = 'n', long = "exclude-filenames")]
     pub exclude_filenames: bool,
 
-    /// Ranking algorithm for search results
+    /// Ranking algorithm for search results. BERT models (ms-marco-*) require --features bert-reranker
     #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25", "hybrid", "hybrid2", "tfidf", "ms-marco-tinybert", "ms-marco-minilm-l6", "ms-marco-minilm-l12"])]
     pub reranker: String,
 
@@ -75,9 +76,9 @@ pub struct Args {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Output format (default: color)
+    /// Output format (default: outline)
     /// Use 'json' or 'xml' for machine-readable output
-    #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["terminal", "markdown", "plain", "json", "xml", "color"])]
+    #[arg(short = 'o', long = "format", default_value = "outline", value_parser = ["terminal", "markdown", "plain", "json", "xml", "color", "outline", "outline-xml"])]
     pub format: String,
 
     /// Session ID for caching search results
@@ -88,9 +89,13 @@ pub struct Args {
     #[arg(long = "timeout", default_value = "30")]
     pub timeout: u64,
 
-    /// Natural language question for BERT reranking (uses search keywords if not specified)
+    /// Natural language question for BERT reranking (requires --features bert-reranker)
     #[arg(long = "question")]
     pub question: Option<String>,
+
+    /// Enable LSP integration for enhanced symbol information
+    #[arg(long = "lsp")]
+    pub lsp: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -104,6 +109,15 @@ pub enum Commands {
     /// It uses frequency-based search with stemming and stopword removal by default,
     /// and ranks results using the BM25 algorithm.
     /// Results are presented as code blocks with relevant context.
+    ///
+    /// Search hints can be used to filter results by file properties:
+    /// - ext:<extension>: Filter by file extension (e.g., "ext:rs")
+    /// - file:<pattern>: Filter by file path pattern (e.g., "file:src/**/*.py")
+    /// - dir:<pattern>: Filter by directory pattern (e.g., "dir:tests")
+    /// - type:<filetype>: Filter by ripgrep file type (e.g., "type:rust")
+    /// - lang:<language>: Filter by programming language (e.g., "lang:javascript")
+    ///
+    /// Example: probe search "function AND ext:rs" ./
     Search {
         /// Search pattern (regex supported)
         #[arg(value_name = "PATTERN")]
@@ -125,7 +139,7 @@ pub enum Commands {
         #[arg(short = 'n', long = "exclude-filenames")]
         exclude_filenames: bool,
 
-        /// Ranking algorithm for search results
+        /// Ranking algorithm for search results. BERT models (ms-marco-*) require --features bert-reranker
         #[arg(short = 'r', long = "reranker", default_value = "bm25", value_parser = ["bm25", "hybrid", "hybrid2", "tfidf", "ms-marco-tinybert", "ms-marco-minilm-l6", "ms-marco-minilm-l12"])]
         reranker: String,
 
@@ -136,6 +150,10 @@ pub enum Commands {
         /// Perform exact search without tokenization (case-insensitive)
         #[arg(short = 'e', long = "exact")]
         exact: bool,
+
+        /// Enforce strict ElasticSearch query syntax (require explicit AND/OR operators and quotes for exact matches)
+        #[arg(long = "strict-elastic-syntax")]
+        strict_elastic_syntax: bool,
 
         /// Programming language to limit search to specific file extensions
         #[arg(short = 'l', long = "language", value_parser = [
@@ -150,7 +168,10 @@ pub enum Commands {
             "ruby", "rb",
             "php",
             "swift",
-            "csharp", "cs"
+            "solidity", "sol",
+            "crystal", "cr",
+            "csharp", "cs",
+            "yaml", "yml"
         ])]
         language: Option<String>,
 
@@ -186,9 +207,9 @@ pub enum Commands {
         #[arg(long = "dry-run")]
         dry_run: bool,
 
-        /// Output format (default: color)
+        /// Output format (default: outline)
         /// Use 'json' or 'xml' for machine-readable output with structured data
-        #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["terminal", "markdown", "plain", "json", "xml", "color"])]
+        #[arg(short = 'o', long = "format", default_value = "outline", value_parser = ["terminal", "markdown", "plain", "json", "xml", "color", "outline", "outline-xml"])]
         format: String,
 
         /// Session ID for caching search results
@@ -199,9 +220,13 @@ pub enum Commands {
         #[arg(long = "timeout", default_value = "30")]
         timeout: u64,
 
-        /// Natural language question for BERT reranking (uses search keywords if not specified)
+        /// Natural language question for BERT reranking (requires --features bert-reranker)
         #[arg(long = "question")]
         question: Option<String>,
+
+        /// Enable LSP integration for enhanced symbol information
+        #[arg(long = "lsp")]
+        lsp: bool,
     },
 
     /// Extract code blocks from files
@@ -230,7 +255,8 @@ pub enum Commands {
 
         /// Output format (default: color)
         /// Use 'json' or 'xml' for machine-readable output with structured data
-        #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["markdown", "plain", "json", "xml", "color"])]
+        /// Use 'outline-diff' for semantically enhanced git diff output
+        #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["markdown", "plain", "json", "xml", "color", "outline-xml", "outline-diff"])]
         format: String,
 
         /// Read input from clipboard instead of files
@@ -260,13 +286,40 @@ pub enum Commands {
         #[arg(short = 'k', long = "keep-input")]
         keep_input: bool,
 
-        /// System prompt template for LLM models (engineer, architect, or path to file)
+        /// System prompt template for LLM models (engineer, architect, code-review, code-review-template, or path to file)
         #[arg(long = "prompt")]
         prompt: Option<String>,
 
         /// User instructions for LLM models
         #[arg(long = "instructions")]
         instructions: Option<String>,
+
+        /// Enable LSP integration for call hierarchy and reference graphs
+        #[arg(long = "lsp")]
+        lsp: bool,
+
+        /// Include standard library references in LSP results (when using --lsp flag)
+        #[arg(long = "include-stdlib")]
+        include_stdlib: bool,
+    },
+
+    /// List symbols (functions, structs, classes, constants, etc.) in files
+    ///
+    /// This command provides a table-of-contents view of a file's symbols using tree-sitter
+    /// AST parsing. It shows functions, structs, classes, constants, type aliases, and other
+    /// definitions with their line numbers and nesting (e.g., methods inside impl blocks).
+    Symbols {
+        /// Files to list symbols from
+        #[arg(value_name = "FILES")]
+        files: Vec<String>,
+
+        /// Output format (default: text)
+        #[arg(short = 'o', long = "format", default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+
+        /// Include test functions/methods
+        #[arg(long = "allow-tests")]
+        allow_tests: bool,
     },
 
     /// Search code using AST patterns for precise structural matching
@@ -298,7 +351,10 @@ pub enum Commands {
             "ruby", "rb",
             "php",
             "swift",
-            "csharp", "cs"
+            "solidity", "sol",
+            "crystal", "cr",
+            "csharp", "cs",
+            "yaml", "yml"
         ])]
         language: Option<String>,
 
@@ -318,9 +374,13 @@ pub enum Commands {
         #[arg(long = "max-results")]
         max_results: Option<usize>,
 
+        /// Include owning source-block context in JSON output
+        #[arg(long = "with-context", alias = "owner-context")]
+        with_context: bool,
+
         /// Output format (default: color)
         /// Use 'json' or 'xml' for machine-readable output with structured data
-        #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["markdown", "plain", "json", "xml", "color"])]
+        #[arg(short = 'o', long = "format", default_value = "color", value_parser = ["markdown", "plain", "json", "xml", "color", "outline-xml"])]
         format: String,
     },
 
@@ -358,5 +418,80 @@ pub enum Commands {
         /// Run only fast benchmarks (shorter duration)
         #[arg(long = "fast")]
         fast: bool,
+    },
+
+    /// Manage LSP daemon and language servers
+    ///
+    /// This command provides tools for managing the LSP daemon that powers
+    /// call hierarchy and reference graph features. Use it to check daemon status,
+    /// restart servers, or troubleshoot LSP integration issues.
+    Lsp {
+        #[command(subcommand)]
+        subcommand: LspSubcommands,
+    },
+
+    /// Manage probe configuration
+    ///
+    /// This command provides tools for managing probe's configuration settings.
+    /// Use it to view the current configuration, validate config files, or
+    /// see what environment variables and config file settings are in effect.
+    Config {
+        #[command(subcommand)]
+        subcommand: ConfigSubcommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigSubcommands {
+    /// Show the current effective configuration
+    Show {
+        /// Output format
+        #[arg(short = 'o', long = "format", default_value = "json", value_parser = ["json", "env"])]
+        format: String,
+    },
+
+    /// Validate the configuration file
+    Validate {
+        /// Path to config file to validate (defaults to ~/.config/probe/config.json)
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
+    },
+
+    /// Set a configuration value
+    Set {
+        /// Configuration key in dot notation (e.g., "search.max_results", "lsp.enable_lsp")
+        key: String,
+
+        /// Value to set (will be parsed based on the key type)
+        value: String,
+
+        /// Configuration scope
+        #[arg(short = 's', long = "scope", default_value = "user", value_parser = ["user", "project", "local"])]
+        scope: String,
+
+        /// Force creation of config file if it doesn't exist
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+    },
+
+    /// Get a specific configuration value
+    Get {
+        /// Configuration key in dot notation (e.g., "search.max_results", "lsp.enable_lsp")
+        key: String,
+
+        /// Show the source of the configuration value
+        #[arg(long = "show-source")]
+        show_source: bool,
+    },
+
+    /// Reset configuration to defaults
+    Reset {
+        /// Configuration scope to reset
+        #[arg(short = 's', long = "scope", default_value = "user", value_parser = ["user", "project", "local", "all"])]
+        scope: String,
+
+        /// Force reset without confirmation
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
 }

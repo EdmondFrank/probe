@@ -8,13 +8,23 @@ use std::time::{Duration, Instant};
 // No need for term_exceptions import
 
 use probe_code::models::{LimitedSearchResults, SearchResult};
+
+/// Configuration for search with structured patterns
+#[derive(Debug, Clone)]
+pub struct SearchConfig<'a> {
+    pub custom_ignores: &'a [String],
+    pub allow_tests: bool,
+    pub language: Option<&'a str>,
+    pub no_gitignore: bool,
+}
 use probe_code::path_resolver::resolve_path;
 use probe_code::search::{
     cache,
     early_ranker,
     // file_list_cache, // Add the new file_list_cache module (unused)
     file_processing::{process_file_with_results, FileProcessingParams},
-    query::{create_query_plan, create_structured_patterns, QueryPlan},
+    filters::SearchFilters,
+    query::{create_structured_patterns, QueryPlan},
     result_ranking::rank_search_results,
     search_limiter::apply_limits,
     search_options::SearchOptions,
@@ -237,6 +247,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         timeout,
         question,
         no_gitignore,
+        lsp,
     } = options;
     // Start the timeout thread
     let timeout_handle = timeout::start_timeout_thread(*timeout);
@@ -355,12 +366,47 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         println!("DEBUG: Starting query preprocessing...");
     }
 
-    let parse_res = if queries.len() > 1 {
-        // Join multiple queries with AND
-        let combined_query = queries.join(" AND ");
-        create_query_plan(&combined_query, *exact)
+    // First, parse the query to extract filters
+    let combined_query = if queries.len() > 1 {
+        queries.join(" AND ")
     } else {
-        create_query_plan(&queries[0], *exact)
+        queries[0].clone()
+    };
+
+    // Parse the combined query into an AST
+    let initial_ast_result = crate::search::elastic_query::parse_query(&combined_query, *exact);
+    if initial_ast_result.is_err() {
+        println!("Failed to parse query as AST expression");
+        return Ok(LimitedSearchResults {
+            results: Vec::new(),
+            skipped_files: Vec::new(),
+            limits_applied: None,
+            cached_blocks_skipped: None,
+            files_skipped_early_termination: None,
+        });
+    }
+
+    let initial_ast = initial_ast_result.unwrap();
+
+    // Extract filters and simplify AST (with auto-detection of filename-like terms)
+    let (search_filters, simplified_ast) =
+        SearchFilters::extract_and_simplify_with_autodetect(initial_ast);
+
+    if debug_mode && !search_filters.is_empty() {
+        println!("DEBUG: Extracted search filters: {search_filters:?}");
+    }
+
+    // If we have a simplified AST, create a query plan from it
+    // Otherwise, if all terms were filters, we'll search all content
+    let plan = if let Some(simplified_ast) = simplified_ast {
+        // Create query plan from simplified AST that contains only content search terms
+        crate::search::query::create_query_plan_from_ast(simplified_ast, *exact)?
+    } else {
+        // All terms were filters - create a universal query plan that matches everything
+        if debug_mode {
+            println!("DEBUG: All query terms were filters - creating universal search plan");
+        }
+        crate::search::query::create_universal_query_plan()
     };
 
     let qp_duration = qp_start.elapsed();
@@ -372,21 +418,6 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             format_duration(qp_duration)
         );
     }
-
-    // If the query fails to parse, return empty results
-    if parse_res.is_err() {
-        println!("Failed to parse query as AST expression");
-        return Ok(LimitedSearchResults {
-            results: Vec::new(),
-            skipped_files: Vec::new(),
-            limits_applied: None,
-            cached_blocks_skipped: None,
-            files_skipped_early_termination: None,
-        });
-    }
-
-    // All queries go through the AST path
-    let plan = parse_res.unwrap();
 
     // Pattern generation timing
     let pg_start = Instant::now();
@@ -436,14 +467,19 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     // Normalize language parameter to handle aliases
     let lang_param = language.as_ref().map(|lang| normalize_language_alias(lang));
 
+    let search_config = SearchConfig {
+        custom_ignores,
+        allow_tests: *allow_tests,
+        language: lang_param,
+        no_gitignore: *no_gitignore,
+    };
+
     let mut file_term_map = search_with_structured_patterns(
         path,
         &plan,
         &structured_patterns,
-        custom_ignores,
-        *allow_tests,
-        lang_param,
-        *no_gitignore,
+        &search_config,
+        &search_filters,
     )?;
 
     let fs_duration = fs_start.elapsed();
@@ -472,8 +508,12 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     let mut all_files = file_term_map.keys().cloned().collect::<HashSet<_>>();
 
     // Add filename matches if enabled
+    // Skip filename matching for exact searches (--exact flag) and when all AST terms
+    // are exact (e.g., quoted queries like "cleanupScopeMappings"). Filename matching
+    // tokenizes terms into subwords which creates false positives for exact queries. (#527)
     let fm_start = Instant::now();
-    if include_filenames && !exact {
+    let ast_all_exact = crate::search::query::is_exact_search(&plan.ast);
+    if include_filenames && !exact && !ast_all_exact {
         if debug_mode {
             println!("DEBUG: Starting filename matching...");
         }
@@ -704,6 +744,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 lines: (1, 1),
                 node_type: "file".to_string(),
                 code: String::new(),
+                symbol_signature: None,
                 matched_by_filename: None,
                 rank: None,
                 score: None,
@@ -722,7 +763,10 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                 parent_file_id: None,
                 block_id: None,
                 matched_keywords: None,
+                matched_lines: None,
                 tokenized_content: None,
+                lsp_info: None,
+                parent_context: None,
             });
         }
         let mut limited = apply_limits(res, *max_results, *max_bytes, *max_tokens);
@@ -899,8 +943,18 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
     // Track total files available for accurate skipped file count
     let total_ranked_files = ranked_files.len();
 
+    // Use dynamic batch size: min of BATCH_SIZE and estimated_files_needed
+    // This prevents processing way more files than needed when limits are strict
+    let effective_batch_size = BATCH_SIZE.min(estimated_files_needed);
+    if debug_mode {
+        println!(
+            "DEBUG: Using batch size {} (BATCH_SIZE={}, estimated_files_needed={})",
+            effective_batch_size, BATCH_SIZE, estimated_files_needed
+        );
+    }
+
     // Process files in batches
-    for batch in ranked_files.chunks(BATCH_SIZE) {
+    for batch in ranked_files.chunks(effective_batch_size) {
         if !should_continue {
             break;
         }
@@ -970,6 +1024,7 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
                     preprocessed_queries: None,
                     no_merge: *no_merge,
                     query_plan: &plan,
+                    lsp: *lsp,
                 };
 
                 if debug_mode {
@@ -1301,17 +1356,18 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
             format_duration(remaining_time)
         );
     }
-    // Rank results (skip if exact flag is set)
+    // Rank results (skip if exact flag is set or all AST terms are exact like quoted queries)
     let rr_start = Instant::now();
+    let skip_ranking = *exact || ast_all_exact;
     if debug_mode {
-        if *exact {
+        if skip_ranking {
             println!("DEBUG: Skipping result ranking due to exact flag being set");
         } else {
             println!("DEBUG: Starting result ranking...");
         }
     }
 
-    if !*exact {
+    if !skip_ranking {
         // Only perform ranking if exact flag is not set
         rank_search_results(&mut final_results, queries, reranker, *question);
 
@@ -1471,6 +1527,23 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
         );
     }
 
+    // Always deduplicate contained blocks (overlapping results from the same
+    // file where one fully contains the other). This is NOT merging — it
+    // removes true duplicates regardless of --no-merge.
+    let limited = if !limited.results.is_empty() {
+        use probe_code::search::block_merging::deduplicate_contained_blocks;
+        let deduped = deduplicate_contained_blocks(limited.results);
+        LimitedSearchResults {
+            results: deduped,
+            skipped_files: limited.skipped_files,
+            limits_applied: limited.limits_applied,
+            cached_blocks_skipped: limited.cached_blocks_skipped,
+            files_skipped_early_termination: limited.files_skipped_early_termination,
+        }
+    } else {
+        limited
+    };
+
     // Optional block merging - AFTER initial caching
     let bm_start = Instant::now();
     if debug_mode && !limited.results.is_empty() && !*no_merge {
@@ -1568,16 +1641,14 @@ pub fn perform_probe(options: &SearchOptions) -> Result<LimitedSearchResults> {
 /// * `root_path` - The base path to search in
 /// * `plan` - The parsed query plan
 /// * `patterns` - The generated regex patterns with their term indices
-/// * `custom_ignores` - Custom ignore patterns
-/// * `allow_tests` - Whether to include test files
+/// * `config` - Search configuration options
+/// * `search_filters` - File filtering options
 pub fn search_with_structured_patterns(
     root_path_str: &Path,
     _plan: &QueryPlan,
     patterns: &[(String, HashSet<usize>)],
-    custom_ignores: &[String],
-    allow_tests: bool,
-    language: Option<&str>,
-    no_gitignore: bool,
+    config: &SearchConfig,
+    search_filters: &SearchFilters,
 ) -> Result<HashMap<PathBuf, HashMap<usize, HashSet<usize>>>> {
     // Resolve the path if it's a special format (e.g., "go:github.com/user/repo")
     let root_path = if let Some(path_str) = root_path_str.to_str() {
@@ -1667,20 +1738,67 @@ pub fn search_with_structured_patterns(
     // Step 2: Get filtered file list from cache
     if debug_mode {
         println!("DEBUG: Getting filtered file list from cache");
-        println!("DEBUG: Custom ignore patterns: {custom_ignores:?}");
+        println!("DEBUG: Custom ignore patterns: {:?}", config.custom_ignores);
     }
 
     // Use file_list_cache to get a filtered list of files, with language filtering if specified
-    let file_list = crate::search::file_list_cache::get_file_list_by_language(
+    let initial_file_list = crate::search::file_list_cache::get_file_list_by_language(
         &root_path,
-        allow_tests,
-        custom_ignores,
-        language,
-        no_gitignore,
+        config.allow_tests,
+        config.custom_ignores,
+        config.language,
+        config.no_gitignore,
     )?;
 
+    // Apply search filters to further filter the file list
+    let filtered_files = if !search_filters.is_empty() {
+        if debug_mode {
+            println!(
+                "DEBUG: Applying search filters to {} files",
+                initial_file_list.files.len()
+            );
+        }
+
+        let filtered: Vec<PathBuf> = initial_file_list
+            .files
+            .iter()
+            .filter(|file_path| {
+                let matches = search_filters.matches_file(file_path);
+                if debug_mode && !matches {
+                    println!("DEBUG: Filter excluded file: {file_path:?}");
+                }
+                matches
+            })
+            .cloned()
+            .collect();
+
+        if debug_mode {
+            println!(
+                "DEBUG: Search filters kept {} out of {} files",
+                filtered.len(),
+                initial_file_list.files.len()
+            );
+        }
+
+        filtered
+    } else {
+        if debug_mode {
+            println!(
+                "DEBUG: No search filters active, using all {} files",
+                initial_file_list.files.len()
+            );
+        }
+        initial_file_list.files.clone()
+    };
+
+    // Create a new file list structure with the filtered files
+    let file_list = probe_code::search::file_list_cache::FileList {
+        files: filtered_files,
+        created_at: initial_file_list.created_at,
+    };
+
     if debug_mode {
-        println!("DEBUG: Got {} files from cache", file_list.files.len());
+        println!("DEBUG: Got {} files after filtering", file_list.files.len());
         if use_simd {
             println!("DEBUG: Starting parallel file processing with SIMD");
         } else {
@@ -1876,6 +1994,8 @@ fn normalize_language_alias(lang: &str) -> &str {
         "cc" | "cxx" | "hpp" | "hxx" => "cpp",
         "rb" => "ruby",
         "cs" => "csharp",
+        "sol" => "solidity",
+        "cr" => "crystal",
         _ => lang, // Return the original language if no alias is found
     }
 }

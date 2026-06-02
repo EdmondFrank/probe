@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ast_grep_core::language::{Language, TSLanguage};
 use ast_grep_core::AstGrep;
 use ast_grep_language::SupportLang;
 use colored::*;
@@ -12,6 +13,8 @@ use std::time::Instant;
 /// Represents a match found by ast-grep
 pub struct AstMatch {
     pub file_path: PathBuf,
+    pub byte_start: usize,
+    pub byte_end: usize,
     pub line_start: usize,
     pub line_end: usize,
     pub column_start: usize,
@@ -27,26 +30,46 @@ pub struct QueryOptions<'a> {
     pub ignore: &'a [String],
     pub allow_tests: bool,
     pub max_results: Option<usize>,
+    pub with_context: bool,
     #[allow(dead_code)]
     pub format: &'a str,
     pub no_gitignore: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ProbeQueryLang {
+    Builtin(SupportLang),
+    Solidity,
+    Crystal,
+}
+
+impl Language for ProbeQueryLang {
+    fn get_ts_language(&self) -> TSLanguage {
+        match self {
+            ProbeQueryLang::Builtin(lang) => lang.get_ts_language(),
+            ProbeQueryLang::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+            ProbeQueryLang::Crystal => tree_sitter_crystal::LANGUAGE.into(),
+        }
+    }
+}
+
 /// Convert a language string to the corresponding SupportLang
-fn get_language(lang: &str) -> Option<SupportLang> {
+fn get_language(lang: &str) -> Option<ProbeQueryLang> {
     match lang.to_lowercase().as_str() {
-        "rust" => Some(SupportLang::Rust),
-        "javascript" => Some(SupportLang::JavaScript),
-        "typescript" => Some(SupportLang::TypeScript),
-        "python" => Some(SupportLang::Python),
-        "go" => Some(SupportLang::Go),
-        "c" => Some(SupportLang::C),
-        "cpp" => Some(SupportLang::Cpp),
-        "java" => Some(SupportLang::Java),
-        "ruby" => Some(SupportLang::Ruby),
-        "php" => Some(SupportLang::Php),
-        "swift" => Some(SupportLang::Swift),
-        "csharp" => Some(SupportLang::CSharp),
+        "rust" => Some(ProbeQueryLang::Builtin(SupportLang::Rust)),
+        "javascript" => Some(ProbeQueryLang::Builtin(SupportLang::JavaScript)),
+        "typescript" => Some(ProbeQueryLang::Builtin(SupportLang::TypeScript)),
+        "python" => Some(ProbeQueryLang::Builtin(SupportLang::Python)),
+        "go" => Some(ProbeQueryLang::Builtin(SupportLang::Go)),
+        "c" => Some(ProbeQueryLang::Builtin(SupportLang::C)),
+        "cpp" => Some(ProbeQueryLang::Builtin(SupportLang::Cpp)),
+        "java" => Some(ProbeQueryLang::Builtin(SupportLang::Java)),
+        "ruby" => Some(ProbeQueryLang::Builtin(SupportLang::Ruby)),
+        "php" => Some(ProbeQueryLang::Builtin(SupportLang::Php)),
+        "swift" => Some(ProbeQueryLang::Builtin(SupportLang::Swift)),
+        "solidity" | "sol" => Some(ProbeQueryLang::Solidity),
+        "crystal" | "cr" => Some(ProbeQueryLang::Crystal),
+        "csharp" => Some(ProbeQueryLang::Builtin(SupportLang::CSharp)),
         _ => None,
     }
 }
@@ -65,6 +88,8 @@ fn get_file_extension(lang: &str) -> Vec<&str> {
         "ruby" => vec![".rb"],
         "php" => vec![".php"],
         "swift" => vec![".swift"],
+        "solidity" | "sol" => vec![".sol"],
+        "crystal" | "cr" => vec![".cr"],
         "csharp" => vec![".cs"],
         _ => vec![],
     }
@@ -127,18 +152,22 @@ fn query_file(file_path: &Path, options: &QueryOptions) -> Result<Vec<AstMatch>>
     } else {
         // If language is not specified, try to infer from file extension
         let inferred_lang = match file_ext {
-            "rs" => Some(SupportLang::Rust),
-            "js" | "jsx" | "mjs" => Some(SupportLang::JavaScript),
-            "ts" | "tsx" => Some(SupportLang::TypeScript),
-            "py" => Some(SupportLang::Python),
-            "go" => Some(SupportLang::Go),
-            "c" | "h" => Some(SupportLang::C),
-            "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => Some(SupportLang::Cpp),
-            "java" => Some(SupportLang::Java),
-            "rb" => Some(SupportLang::Ruby),
-            "php" => Some(SupportLang::Php),
-            "swift" => Some(SupportLang::Swift),
-            "cs" => Some(SupportLang::CSharp),
+            "rs" => Some(ProbeQueryLang::Builtin(SupportLang::Rust)),
+            "js" | "jsx" | "mjs" => Some(ProbeQueryLang::Builtin(SupportLang::JavaScript)),
+            "ts" | "tsx" => Some(ProbeQueryLang::Builtin(SupportLang::TypeScript)),
+            "py" => Some(ProbeQueryLang::Builtin(SupportLang::Python)),
+            "go" => Some(ProbeQueryLang::Builtin(SupportLang::Go)),
+            "c" | "h" => Some(ProbeQueryLang::Builtin(SupportLang::C)),
+            "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => {
+                Some(ProbeQueryLang::Builtin(SupportLang::Cpp))
+            }
+            "java" => Some(ProbeQueryLang::Builtin(SupportLang::Java)),
+            "rb" => Some(ProbeQueryLang::Builtin(SupportLang::Ruby)),
+            "php" => Some(ProbeQueryLang::Builtin(SupportLang::Php)),
+            "swift" => Some(ProbeQueryLang::Builtin(SupportLang::Swift)),
+            "sol" => Some(ProbeQueryLang::Solidity),
+            "cr" => Some(ProbeQueryLang::Crystal),
+            "cs" => Some(ProbeQueryLang::Builtin(SupportLang::CSharp)),
             _ => None, // Unsupported extension
         };
 
@@ -204,6 +233,8 @@ fn query_file(file_path: &Path, options: &QueryOptions) -> Result<Vec<AstMatch>>
 
         ast_matches.push(AstMatch {
             file_path: file_path.to_path_buf(),
+            byte_start: range.start,
+            byte_end: range.end,
             line_start,
             line_end,
             column_start,
@@ -234,7 +265,7 @@ pub fn perform_query(options: &QueryOptions) -> Result<Vec<AstMatch>> {
     let resolved_path = if let Some(path_str) = options.path.to_str() {
         match resolve_path(path_str) {
             Ok(resolved_path) => {
-                if std::env::var("DEBUG").unwrap_or_default() == "1" {
+                if std::env::var("PROBE_DEBUG").unwrap_or_default() == "1" {
                     println!(
                         "DEBUG: Resolved path '{}' to '{}'",
                         path_str,
@@ -244,7 +275,7 @@ pub fn perform_query(options: &QueryOptions) -> Result<Vec<AstMatch>> {
                 resolved_path
             }
             Err(err) => {
-                if std::env::var("DEBUG").unwrap_or_default() == "1" {
+                if std::env::var("PROBE_DEBUG").unwrap_or_default() == "1" {
                     println!("DEBUG: Failed to resolve path '{path_str}': {err}");
                 }
                 // Fall back to the original path
@@ -258,6 +289,10 @@ pub fn perform_query(options: &QueryOptions) -> Result<Vec<AstMatch>> {
 
     // Collect file paths using WalkBuilder to conditionally respect gitignore
     let mut builder = WalkBuilder::new(&resolved_path);
+
+    // Follow symlinks by default. Loop detection is handled by walkdir internally -
+    // it detects and reports symlink loops as errors, preventing infinite traversal.
+    builder.follow_links(true);
 
     // Configure gitignore handling based on the no_gitignore option
     if !options.no_gitignore {
@@ -318,7 +353,12 @@ fn escape_xml(s: &str) -> String {
 }
 
 /// Format and print the query results
-pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Result<()> {
+pub fn format_and_print_query_results(
+    matches: &[AstMatch],
+    format: &str,
+    pattern: &str,
+    with_context: bool,
+) -> Result<()> {
     match format {
         "color" | "terminal" => {
             for m in matches {
@@ -371,30 +411,58 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
             }
         }
         "json" => {
+            use std::collections::HashMap;
+
             // BATCH TOKENIZATION WITH DEDUPLICATION OPTIMIZATION for query JSON output:
             // Process all matched text in batch to leverage content deduplication
             use probe_code::search::search_tokens::sum_tokens_with_deduplication;
+            use probe_code::semantic_context::ParsedSourceContext;
+
             let matched_texts: Vec<&str> =
                 matches.iter().map(|m| m.matched_text.as_str()).collect();
             let total_tokens = sum_tokens_with_deduplication(&matched_texts);
+
+            let mut parsed_files: HashMap<std::path::PathBuf, Option<ParsedSourceContext>> =
+                HashMap::new();
 
             // Create standardized results
             let json_matches_standardized: Vec<_> = matches
                 .iter()
                 .map(|m| {
-                    serde_json::json!({
+                    let mut result = serde_json::json!({
                         "file": m.file_path.to_string_lossy(),
                         "lines": [m.line_start, m.line_end],
                         "node_type": "match",
                         "content": m.matched_text,
                         "column_start": m.column_start,
                         "column_end": m.column_end
-                    })
+                    });
+
+                    if with_context {
+                        let parsed = parsed_files
+                            .entry(m.file_path.clone())
+                            .or_insert_with(|| ParsedSourceContext::parse(&m.file_path));
+                        if let Some(context) = parsed.as_ref().and_then(|parsed| {
+                            parsed.query_source_context(m.byte_start, m.byte_end, &m.matched_text)
+                        }) {
+                            result["language"] = serde_json::json!(context.language);
+                            result["pattern"] = serde_json::json!({
+                                "source": pattern,
+                                "id": serde_json::Value::Null,
+                            });
+                            result["match"] = serde_json::json!(context.r#match);
+                            if let Some(owner) = context.owner {
+                                result["owner"] = serde_json::json!(owner);
+                            }
+                        }
+                    }
+
+                    result
                 })
                 .collect();
 
             // Create the wrapper object
-            let wrapper = serde_json::json!({
+            let mut wrapper = serde_json::json!({
                 "results": json_matches_standardized,
                 "summary": {
                     "count": matches.len(),
@@ -403,6 +471,9 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
                 },
                 "version": probe_code::version::get_version()
             });
+            if with_context {
+                wrapper["schema_version"] = serde_json::json!("probe.query.context.v1");
+            }
 
             println!("{}", serde_json::to_string_pretty(&wrapper)?);
         }
@@ -451,7 +522,7 @@ pub fn format_and_print_query_results(matches: &[AstMatch], format: &str) -> Res
         }
         _ => {
             // Default to color format
-            format_and_print_query_results(matches, "color")?;
+            format_and_print_query_results(matches, "color", pattern, with_context)?;
         }
     }
 
@@ -469,7 +540,13 @@ pub fn handle_query(
     max_results: Option<usize>,
     format: &str,
     no_gitignore: bool,
+    with_context: bool,
 ) -> Result<()> {
+    // Print version at the start for text-based formats
+    if format != "json" && format != "xml" {
+        println!("Probe version: {}", probe_code::version::get_version());
+    }
+
     // Only print information for non-JSON/XML formats
     if format != "json" && format != "xml" {
         println!("{} {}", "Pattern:".bold().green(), pattern);
@@ -512,6 +589,7 @@ pub fn handle_query(
         ignore,
         allow_tests,
         max_results,
+        with_context,
         format,
         no_gitignore,
     };
@@ -524,7 +602,7 @@ pub fn handle_query(
     if matches.is_empty() {
         // For JSON and XML formats, still call format_and_print_query_results
         if format == "json" || format == "xml" {
-            format_and_print_query_results(&matches, format)?;
+            format_and_print_query_results(&matches, format, pattern, with_context)?;
         } else {
             // For other formats, print the "No results found" message
             println!("{}", "No results found.".yellow().bold());
@@ -537,7 +615,7 @@ pub fn handle_query(
             println!();
         }
 
-        format_and_print_query_results(&matches, format)?;
+        format_and_print_query_results(&matches, format, pattern, with_context)?;
 
         // Skip summary for JSON and XML formats
         if format != "json" && format != "xml" {
@@ -554,9 +632,85 @@ pub fn handle_query(
 
             println!("Total bytes returned: {total_bytes}");
             println!("Total tokens returned: {total_tokens}");
-            println!("Probe version: {}", probe_code::version::get_version());
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_solidity_query_support() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("Counter.sol");
+        fs::write(
+            &file,
+            r#"
+contract Counter {
+    uint256 private _value;
+
+    function increment() public {
+        _value += 1;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let options = QueryOptions {
+            path: temp_dir.path(),
+            pattern: "function $NAME() public { $$$BODY }",
+            language: Some("solidity"),
+            ignore: &[],
+            allow_tests: true,
+            max_results: Some(10),
+            with_context: false,
+            format: "json",
+            no_gitignore: true,
+        };
+
+        let matches = perform_query(&options).expect("Solidity query should run");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file_path, file);
+        assert!(matches[0].matched_text.contains("function increment()"));
+    }
+
+    #[test]
+    fn test_crystal_query_support() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("counter.cr");
+        fs::write(
+            &file,
+            r#"
+class Counter
+  def increment : Int32
+    1
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let options = QueryOptions {
+            path: temp_dir.path(),
+            pattern: "def increment : Int32",
+            language: Some("crystal"),
+            ignore: &[],
+            allow_tests: true,
+            max_results: Some(10),
+            with_context: false,
+            format: "json",
+            no_gitignore: true,
+        };
+
+        let matches = perform_query(&options).expect("Crystal query should run");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file_path, file);
+        assert!(matches[0].matched_text.contains("def increment"));
+    }
 }

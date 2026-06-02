@@ -21,4 +21,31 @@ pub trait LanguageImpl {
         // Default implementation returns None
         None
     }
+
+    /// Extract the symbol signature without implementation body
+    /// Returns a clean signature for functions, structs, classes, methods, constants, etc.
+    fn get_symbol_signature(&self, _node: &Node, _source: &[u8]) -> Option<String> {
+        // Default implementation returns None
+        // Each language should implement this to extract clean signatures
+        None
+    }
+
+    /// Check if a node is a symbol that should appear in a file's symbol tree/TOC.
+    /// Broader than is_acceptable_parent — includes constants, type aliases, etc.
+    /// Override in language implementations to add language-specific symbol types.
+    fn is_symbol_node(&self, node: &Node) -> bool {
+        self.is_acceptable_parent(node)
+    }
+
+    /// Extract the receiver/associated type name from a method declaration node.
+    ///
+    /// For languages where methods are declared outside of type definitions
+    /// (e.g., Go receiver methods: `func (r *Type) Method()`), this method
+    /// extracts the type name ("Type") so that `Type.Method` lookups can
+    /// resolve correctly.
+    ///
+    /// Default: returns None (most languages use class nesting instead).
+    fn get_receiver_type(&self, _node: &Node, _source: &[u8]) -> Option<String> {
+        None
+    }
 }

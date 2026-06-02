@@ -13,12 +13,15 @@ on:
 
 permissions:
   contents: write # Required to upload release assets
+  id-token: write # Required for npm OIDC authentication
 
 jobs:
   build-and-release:
     name: Build and Release for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
@@ -49,7 +52,7 @@ jobs:
 
       # Install Rust toolchain
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.84.0
+        uses: dtolnay/rust-toolchain@1.92.0
         with:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
@@ -57,7 +60,7 @@ jobs:
       # Setup Rust cache
       - name: Setup Rust cache
         uses: actions/cache@v4
-        timeout-minutes: 5
+        timeout-minutes: 10
         with:
           path: |
             ~/.cargo/bin/
@@ -98,6 +101,7 @@ jobs:
 
       # Build the Rust project
       - name: Build Release
+        timeout-minutes: 45
         shell: bash
         run: |
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
@@ -110,12 +114,6 @@ jobs:
             # For other platforms, use the default build
             cargo build --release --target ${{ matrix.target }}
           fi
-
-      # Install zip on Windows
-      - name: Install zip on Windows
-        if: runner.os == 'Windows'
-        run: |
-          choco install zip -y
 
       # Package the binary into an archive
       - name: Package Binary
@@ -144,7 +142,8 @@ jobs:
             tar -czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
             echo "ASSET=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
           elif [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            zip -r "${ARCHIVE_NAME}.zip" "${ARCHIVE_NAME}"
+            # Use PowerShell's built-in Compress-Archive (Windows native, no third-party tools needed)
+            powershell -Command "Compress-Archive -Path '${ARCHIVE_NAME}' -DestinationPath '${ARCHIVE_NAME}.zip'"
             echo "ASSET=${ARCHIVE_NAME}.zip" >> "$GITHUB_ENV"
           fi
 

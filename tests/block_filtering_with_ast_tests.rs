@@ -397,17 +397,22 @@ fn test_required_terms_query() {
     let _query = "+ip +whitelist +security";
 
     // Create a custom AST with OR semantics for required terms
+    let keywords1 = vec!["ip".to_string()];
+    let keywords2 = vec!["white".to_string(), "list".to_string()];
+    let keywords3 = vec!["secur".to_string()];
     let ast = elastic_query::Expr::Or(
         Box::new(elastic_query::Expr::Or(
             Box::new(elastic_query::Expr::Term {
-                keywords: vec!["ip".to_string()],
+                lowercase_keywords: keywords1.iter().map(|k| k.to_lowercase()).collect(),
+                keywords: keywords1,
                 field: None,
                 required: true,
                 excluded: false,
                 exact: false,
             }),
             Box::new(elastic_query::Expr::Term {
-                keywords: vec!["white".to_string(), "list".to_string()],
+                lowercase_keywords: keywords2.iter().map(|k| k.to_lowercase()).collect(),
+                keywords: keywords2,
                 field: None,
                 required: true,
                 excluded: false,
@@ -415,7 +420,8 @@ fn test_required_terms_query() {
             }),
         )),
         Box::new(elastic_query::Expr::Term {
-            keywords: vec!["secur".to_string()],
+            lowercase_keywords: keywords3.iter().map(|k| k.to_lowercase()).collect(),
+            keywords: keywords3,
             field: None,
             required: true,
             excluded: false,
@@ -447,6 +453,9 @@ fn test_required_terms_query() {
         required_terms_indices,
         has_only_excluded_terms,
         evaluation_cache,
+        is_universal_query: false,
+        special_case_indices: HashSet::new(),
+        special_case_terms_lower: HashMap::new(),
     };
 
     // Use the term indices directly

@@ -80,7 +80,7 @@ pub fn get_file_list(
     custom_ignores: &[String],
     no_gitignore: bool,
 ) -> Result<Arc<FileList>> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -143,7 +143,7 @@ fn build_file_list(
     custom_ignores: &[String],
     no_gitignore: bool,
 ) -> Result<FileList> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -154,11 +154,30 @@ fn build_file_list(
     let builder_start = Instant::now();
     let mut builder = WalkBuilder::new(path);
 
+    // Follow symlinks so that symlinked subdirectories are searched (#532).
+    // The `walkdir` crate (used by `ignore`) has built-in loop detection,
+    // and `same_file_system(true)` below prevents crossing mount points.
+    builder.follow_links(true);
+
+    // Stay on the same file system to avoid traversing mount points
+    builder.same_file_system(true);
+
+    // CRITICAL: Disable parent directory discovery to prevent climbing into junction cycles
+    // This is THE KEY fix for Windows CI where temp dirs under D:\a\... have junction cycles
+    builder.parents(false);
+
+    // Honor PROBE_NO_GITIGNORE if set (e.g., by Windows CI safety guards)
+    let no_gitignore_override = no_gitignore || std::env::var("PROBE_NO_GITIGNORE").is_ok();
+
     // Configure the builder to conditionally respect gitignore files
-    if !no_gitignore {
+    if !no_gitignore_override {
         builder.git_ignore(true);
         builder.git_global(true);
         builder.git_exclude(true);
+        // IMPORTANT: Allow .gitignore files to work even outside git repositories
+        // This makes the ignore crate work consistently regardless of whether
+        // the directory is a git repository or not
+        builder.require_git(false);
     } else {
         builder.git_ignore(false);
         builder.git_global(false);
@@ -249,6 +268,7 @@ fn build_file_list(
             "*_test.rb",
             "test_*.rb",
             "*_spec.rb",
+            "*_spec.cr",
             "*Test.php",
             "test_*.php",
             "**/tests/**",
@@ -318,6 +338,21 @@ fn build_file_list(
             continue;
         }
 
+        // Extra defensive check: skip symlinks even though we configured the walker not to follow them
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            if debug_mode {
+                println!("DEBUG: Skipping symlink file: {:?}", entry.path());
+            }
+            continue;
+        }
+
+        if !allow_tests && is_test_path(path, entry.path()) {
+            if debug_mode {
+                println!("DEBUG: Skipping test file: {:?}", entry.path());
+            }
+            continue;
+        }
+
         files.push(entry.path().to_path_buf());
     }
 
@@ -351,6 +386,51 @@ fn build_file_list(
     })
 }
 
+fn is_test_path(search_root: &Path, file_path: &Path) -> bool {
+    if search_root.is_dir()
+        && search_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_test_dir_name)
+    {
+        return true;
+    }
+
+    let path_to_check = file_path
+        .strip_prefix(search_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(file_path);
+
+    let has_test_dir = path_to_check.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        is_test_dir_name(&name)
+    });
+
+    if has_test_dir {
+        return true;
+    }
+
+    let Some(file_name) = path_to_check.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    file_name.starts_with("test_")
+        || file_name.contains("_test.")
+        || file_name.contains("_spec.")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("Test.java")
+        || file_name.ends_with("Test.php")
+}
+
+fn is_test_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        "test" | "tests" | "__test__" | "__tests__" | "spec" | "specs"
+    )
+}
+
 /// Find files whose names match query words
 /// Returns a map of file paths to the term indices that matched the filename
 #[allow(clippy::too_many_arguments)]
@@ -364,7 +444,7 @@ pub fn find_matching_filenames(
     language: Option<&str>,
     no_gitignore: bool,
 ) -> Result<HashMap<PathBuf, HashSet<usize>>> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -479,7 +559,11 @@ fn get_language_extensions(language: &str) -> Vec<String> {
         "ruby" => vec![".rb".to_string(), ".rake".to_string()],
         "php" => vec![".php".to_string()],
         "swift" => vec![".swift".to_string()],
+        "solidity" => vec![".sol".to_string()],
+        "crystal" => vec![".cr".to_string()],
         "csharp" => vec![".cs".to_string()],
+        "markdown" => vec![".md".to_string(), ".markdown".to_string()],
+        "yaml" => vec![".yaml".to_string(), ".yml".to_string()],
         _ => vec![], // Return empty vector for unknown languages
     }
 }
@@ -497,7 +581,7 @@ pub fn get_file_list_by_language(
         return get_file_list(path, allow_tests, custom_ignores, no_gitignore);
     }
 
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -742,16 +826,12 @@ mod tests {
     fn test_no_gitignore_parameter() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Initialize git repo to make .gitignore work with the ignore crate
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(temp_dir.path())
-            .output()
-            .expect("Failed to initialize git repo");
-
-        // Create a .gitignore file
+        // Create a .gitignore file - no git repository needed!
+        // The ignore crate will respect .gitignore files even without a git repo
+        // when builder.require_git(false) is set
         let gitignore_content = "*.ignored\nignored_dir/\n";
-        fs::write(temp_dir.path().join(".gitignore"), gitignore_content).unwrap();
+        let gitignore_path = temp_dir.path().join(".gitignore");
+        fs::write(&gitignore_path, gitignore_content).unwrap();
 
         // Create files that would normally be ignored by .gitignore
         let ignored_file = temp_dir.path().join("test.ignored");
@@ -834,6 +914,47 @@ mod tests {
         assert!(
             key_without_gitignore.contains("no_gitignore"),
             "Cache key should contain 'no_gitignore' when no_gitignore is true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_list_follows_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a real directory with a source file outside the root
+        let real_dir = root.join("real_subdir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("hello.rs");
+        std::fs::write(&real_file, "fn hello() {}").unwrap();
+
+        // Create a workspace directory and symlink the real directory into it
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let linked = workspace.join("linked");
+        symlink(&real_dir, &linked).unwrap();
+
+        // Also add a regular file in the workspace
+        let regular = workspace.join("main.rs");
+        std::fs::write(&regular, "fn main() {}").unwrap();
+
+        // Build file list from workspace — should find files in the symlinked dir
+        let file_list = build_file_list(&workspace, true, &[], false).unwrap();
+
+        assert!(
+            file_list.files.iter().any(|f| f.ends_with("main.rs")),
+            "Regular file should be found"
+        );
+        assert!(
+            file_list
+                .files
+                .iter()
+                .any(|f| { f.to_string_lossy().contains("linked") && f.ends_with("hello.rs") }),
+            "File inside symlinked directory should be found, got: {:?}",
+            file_list.files
         );
     }
 }

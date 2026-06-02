@@ -6,6 +6,7 @@ use tree_sitter::Language;
 extern crate tree_sitter_c;
 extern crate tree_sitter_c_sharp;
 extern crate tree_sitter_cpp;
+extern crate tree_sitter_crystal;
 extern crate tree_sitter_go;
 extern crate tree_sitter_java;
 extern crate tree_sitter_javascript;
@@ -13,6 +14,7 @@ extern crate tree_sitter_php;
 extern crate tree_sitter_python;
 extern crate tree_sitter_ruby;
 extern crate tree_sitter_rust;
+extern crate tree_sitter_solidity;
 extern crate tree_sitter_swift;
 extern crate tree_sitter_typescript;
 
@@ -31,6 +33,8 @@ fn get_language(extension: &str) -> Option<Language> {
         "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         "cs" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        "sol" => Some(tree_sitter_solidity::LANGUAGE.into()),
+        "cr" => Some(tree_sitter_crystal::LANGUAGE.into()),
         // It seems tree_sitter_php::LANGUAGE doesn't exist, so we'll return None for PHP
         "php" => None,
         _ => None,
@@ -55,11 +59,43 @@ fn test_get_language() {
     assert!(get_language("rb").is_some()); // Ruby
     assert!(get_language("swift").is_some()); // Swift
     assert!(get_language("cs").is_some()); // C#
+    assert!(get_language("sol").is_some()); // Solidity
+    assert!(get_language("cr").is_some()); // Crystal
     assert!(get_language("php").is_none()); // PHP (not supported in current tree-sitter version)
 
     // Test unsupported language
     assert!(get_language("txt").is_none());
     assert!(get_language("").is_none());
+}
+
+#[test]
+fn test_crystal_language_implementation() {
+    let crystal_impl = get_language_impl("cr");
+    assert!(
+        crystal_impl.is_some(),
+        "Should be able to get Crystal language implementation"
+    );
+
+    let language = get_language("cr");
+    assert!(
+        language.is_some(),
+        "Should be able to get Crystal tree-sitter language"
+    );
+}
+
+#[test]
+fn test_solidity_language_implementation() {
+    let solidity_impl = get_language_impl("sol");
+    assert!(
+        solidity_impl.is_some(),
+        "Should be able to get Solidity language implementation"
+    );
+
+    let language = get_language("sol");
+    assert!(
+        language.is_some(),
+        "Should be able to get Solidity tree-sitter language"
+    );
 }
 
 #[test]
@@ -187,6 +223,7 @@ fn test_merge_code_blocks() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
         CodeBlock {
             start_row: 5,
@@ -197,6 +234,7 @@ fn test_merge_code_blocks() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
         // Overlapping block
         CodeBlock {
@@ -208,6 +246,7 @@ fn test_merge_code_blocks() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
     ];
 
@@ -237,6 +276,7 @@ fn test_merge_code_blocks_no_overlap() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
         CodeBlock {
             start_row: 15, // Changed from 10 to 15 to ensure gap > 10 lines
@@ -247,6 +287,7 @@ fn test_merge_code_blocks_no_overlap() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
     ];
 
@@ -269,6 +310,7 @@ fn test_merge_code_blocks_struct_type() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
         // This is more than 10 lines away, so they should not merge
         CodeBlock {
@@ -280,6 +322,7 @@ fn test_merge_code_blocks_struct_type() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
     ];
 
@@ -299,6 +342,7 @@ fn test_merge_code_blocks_struct_type() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
         // This is within 10 lines, so they should merge
         CodeBlock {
@@ -310,6 +354,7 @@ fn test_merge_code_blocks_struct_type() {
             parent_node_type: None,
             parent_start_row: None,
             parent_end_row: None,
+            parent_context: None,
         },
     ];
 

@@ -1,4 +1,5 @@
 use probe_code::search::elastic_query;
+use probe_code::search::tokenization;
 // No term_exceptions import needed
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +49,16 @@ pub struct QueryPlan {
     pub has_only_excluded_terms: bool,
     /// Evaluation result cache for matched term patterns
     pub evaluation_cache: Arc<Mutex<LruCache<u64, bool>>>,
+    /// Flag indicating this is a universal query that should match all content
+    /// (typically used when only filename filters are specified)
+    pub is_universal_query: bool,
+
+    // PHASE 5 OPTIMIZATION: Pre-computed special case terms
+    /// Pre-computed: set of term indices that are special cases
+    /// This avoids repeated is_special_case() calls during filtering
+    pub special_case_indices: HashSet<usize>,
+    /// Pre-computed: lowercase versions of special case terms for O(1) lookup
+    pub special_case_terms_lower: HashMap<usize, String>,
 }
 
 impl std::fmt::Debug for QueryPlan {
@@ -62,6 +73,8 @@ impl std::fmt::Debug for QueryPlan {
             .field("has_required_anywhere", &self.has_required_anywhere)
             .field("required_terms_indices", &self.required_terms_indices)
             .field("has_only_excluded_terms", &self.has_only_excluded_terms)
+            .field("is_universal_query", &self.is_universal_query)
+            .field("special_case_indices", &self.special_case_indices)
             .field("evaluation_cache", &"<LruCache>")
             .finish()
     }
@@ -79,7 +92,7 @@ fn format_duration(duration: std::time::Duration) -> String {
 /// Create a QueryPlan from a raw query string. This fully parses the query into an AST,
 /// then extracts all terms (including excluded), and prepares a term-index map.
 pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_query::ParseError> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -183,6 +196,16 @@ pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_
         .filter_map(|term| term_indices.get(term).cloned())
         .collect();
 
+    // PHASE 5 OPTIMIZATION: Pre-compute special case terms once
+    let mut special_case_indices = HashSet::new();
+    let mut special_case_terms_lower = HashMap::new();
+    for (term, &idx) in &term_indices {
+        if tokenization::is_special_case(term) {
+            special_case_indices.insert(idx);
+            special_case_terms_lower.insert(idx, term.to_lowercase());
+        }
+    }
+
     // Create evaluation cache with reasonable capacity
     let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
 
@@ -197,6 +220,9 @@ pub fn create_query_plan(query: &str, exact: bool) -> Result<QueryPlan, elastic_
         required_terms_indices,
         has_only_excluded_terms,
         evaluation_cache,
+        is_universal_query: false,
+        special_case_indices,
+        special_case_terms_lower,
     })
 }
 
@@ -245,7 +271,7 @@ fn update_ast_exact(expr: &mut elastic_query::Expr) {
 }
 
 /// Helper function to check if the AST represents an exact search
-fn is_exact_search(expr: &elastic_query::Expr) -> bool {
+pub fn is_exact_search(expr: &elastic_query::Expr) -> bool {
     match expr {
         elastic_query::Expr::Term { exact, .. } => *exact,
         elastic_query::Expr::And(left, right) => is_exact_search(left) && is_exact_search(right),
@@ -260,7 +286,7 @@ fn collect_all_terms(
     all_terms: &mut Vec<String>,
     excluded: &mut HashSet<String>,
 ) {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
         println!("DEBUG: Collecting terms from expression: {expr:?}");
@@ -268,26 +294,27 @@ fn collect_all_terms(
 
     match expr {
         elastic_query::Expr::Term {
-            keywords,
+            lowercase_keywords,
             field: _,
             excluded: is_excluded,
-            exact: _,
             ..
         } => {
-            // Add all keywords to all_terms
-            all_terms.extend(keywords.clone());
+            // Use pre-computed lowercase_keywords instead of re-converting
+            all_terms.extend(lowercase_keywords.iter().cloned());
 
             if debug_mode {
-                println!("DEBUG: Collected keywords '{keywords:?}', excluded={is_excluded}");
+                println!(
+                    "DEBUG: Collected keywords '{lowercase_keywords:?}', excluded={is_excluded}"
+                );
             }
 
             if *is_excluded {
-                for keyword in keywords {
+                for keyword in lowercase_keywords {
                     if debug_mode {
                         println!("DEBUG: Adding '{keyword}' to excluded terms set");
                     }
 
-                    // Add the keyword to excluded terms
+                    // Use pre-computed lowercase keywords
                     excluded.insert(keyword.clone());
                 }
             }
@@ -299,12 +326,12 @@ fn collect_all_terms(
 
             // Check if the right side is an excluded term
             if let elastic_query::Expr::Term {
-                keywords,
+                lowercase_keywords,
                 excluded: true,
                 ..
             } = &**right
             {
-                for keyword in keywords {
+                for keyword in lowercase_keywords {
                     if debug_mode {
                         println!("DEBUG: Adding excluded term '{keyword}' from AND expression");
                     }
@@ -334,15 +361,33 @@ fn collect_all_terms(
 /// This creates a single pattern that matches any of the terms using case-insensitive matching
 /// without word boundaries for more flexible matching
 pub fn build_combined_pattern(terms: &[String]) -> String {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
         println!("DEBUG: Building combined pattern for {} terms", terms.len());
     }
 
+    // Limit the number of terms to prevent regex size explosion
+    const MAX_TERMS_IN_PATTERN: usize = 1000;
+    let limited_terms = if terms.len() > MAX_TERMS_IN_PATTERN {
+        if debug_mode {
+            println!(
+                "DEBUG: Limiting pattern to first {} terms (was {})",
+                MAX_TERMS_IN_PATTERN,
+                terms.len()
+            );
+        }
+        &terms[..MAX_TERMS_IN_PATTERN]
+    } else {
+        terms
+    };
+
     // Escape special characters in each term
-    let escaped_terms = terms.iter().map(|t| regex_escape(t)).collect::<Vec<_>>();
+    let escaped_terms = limited_terms
+        .iter()
+        .map(|t| regex_escape(t))
+        .collect::<Vec<_>>();
 
     // Join terms with | operator and add case-insensitive flag without word boundaries
     let pattern = format!("(?i)({terms})", terms = escaped_terms.join("|"));
@@ -350,9 +395,14 @@ pub fn build_combined_pattern(terms: &[String]) -> String {
     if debug_mode {
         let duration = start_time.elapsed();
         println!(
-            "DEBUG: Combined pattern built in {}: {}",
+            "DEBUG: Combined pattern built in {} with {} terms: {}",
             format_duration(duration),
-            pattern
+            limited_terms.len(),
+            if pattern.len() > 200 {
+                format!("{}...", &pattern[..200])
+            } else {
+                pattern.clone()
+            }
         );
     }
 
@@ -363,7 +413,7 @@ pub fn build_combined_pattern(terms: &[String]) -> String {
 /// This creates a single combined pattern for all terms, regardless of whether they're
 /// required, optional, or negative.
 pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usize>)> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
     let start_time = Instant::now();
 
     if debug_mode {
@@ -372,6 +422,7 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
     }
 
     let mut results = Vec::new();
+    const MAX_PATTERNS: usize = 5000; // Limit total patterns to prevent regex size explosion
 
     if debug_mode {
         println!("DEBUG: Creating structured patterns with AST awareness");
@@ -389,18 +440,16 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
     if !terms.is_empty() {
         let combined_pattern = build_combined_pattern(&terms);
 
-        // Create a HashSet with indices of non-excluded terms
-        let all_indices: HashSet<usize> = terms
-            .iter()
-            .filter_map(|term| plan.term_indices.get(term).cloned())
-            .collect();
-
+        // IMPORTANT: Do not associate the combined pattern with all term indices.
+        // We cannot know which specific term matched from this pattern alone.
+        // Keep it for quick pre-filtering, but map it to an empty index set.
         if debug_mode {
-            println!("DEBUG: Created combined pattern for all terms: '{combined_pattern}'");
-            println!("DEBUG: Combined pattern includes indices: {all_indices:?}");
+            println!(
+                "DEBUG: Created combined pattern for all terms (no indices associated): '{combined_pattern}'"
+            );
         }
 
-        results.push((combined_pattern, all_indices));
+        results.push((combined_pattern, HashSet::new()));
 
         // Continue to generate individual patterns instead of returning early
     }
@@ -430,8 +479,9 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
 
                 // Process each keyword
                 for keyword in keywords {
+                    let keyword_key = keyword.to_lowercase();
                     // Note: We still generate patterns for excluded terms so they can be found and then filtered out
-                    if debug_mode && plan.excluded_terms.contains(keyword) {
+                    if debug_mode && plan.excluded_terms.contains(&keyword_key) {
                         println!(
                             "DEBUG: Generating pattern for globally excluded keyword (will be filtered during evaluation): '{keyword}'"
                         );
@@ -440,7 +490,7 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                     // No need for an additional check here for `*excluded` as the outer check handles it.
 
                     // Find the keyword's index in term_indices
-                    if let Some(&idx) = plan.term_indices.get(keyword) {
+                    if let Some(&idx) = plan.term_indices.get(&keyword_key) {
                         let base_pattern = regex_escape(keyword);
 
                         // For exact terms, use stricter matching
@@ -456,8 +506,8 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
 
                         results.push((pattern, HashSet::from([idx])));
 
-                        // Only tokenize if not exact
-                        if !*exact {
+                        // Only tokenize if not exact and not excluded
+                        if !*exact && !*excluded {
                             // Generate patterns for each token of the term to match AST tokenization
                             let tokens = crate::search::tokenization::tokenize_and_stem(keyword);
 
@@ -479,7 +529,13 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                                 results.push((pattern, HashSet::from([idx])));
                             }
                         } else if debug_mode {
-                            println!("DEBUG: Skipping tokenization for exact term '{keyword}'");
+                            if *excluded {
+                                println!(
+                                    "DEBUG: Skipping tokenization for excluded term '{keyword}' to avoid false positives"
+                                );
+                            } else {
+                                println!("DEBUG: Skipping tokenization for exact term '{keyword}'");
+                            }
                         }
                     }
                 }
@@ -497,50 +553,10 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
                     println!("DEBUG: Processing OR expression");
                 }
 
-                // For OR, create combined patterns
-                let mut left_patterns = Vec::new();
-                let mut right_patterns = Vec::new();
-
-                collect_patterns(left, plan, &mut left_patterns, debug_mode);
-                collect_patterns(right, plan, &mut right_patterns, debug_mode);
-
-                if !left_patterns.is_empty() && !right_patterns.is_empty() {
-                    // Combine the patterns with OR
-                    let combined = format!(
-                        "({}|{})",
-                        left_patterns
-                            .iter()
-                            .map(|(p, _)| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join("|"),
-                        right_patterns
-                            .iter()
-                            .map(|(p, _)| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    );
-
-                    // Merge the term indices
-                    let mut indices = HashSet::new();
-                    for (_, idx_set) in left_patterns.iter().chain(right_patterns.iter()) {
-                        indices.extend(idx_set.iter().cloned());
-                    }
-
-                    if debug_mode {
-                        println!("DEBUG: Created combined OR pattern: '{combined}'");
-                        println!("DEBUG: Combined indices: {indices:?}");
-                    }
-
-                    results.push((combined, indices));
-                }
-
-                // Also add individual patterns to ensure we catch all matches
-                // This is important for multi-keyword terms where we want to match any of the keywords
-                if debug_mode {
-                    println!("DEBUG: Adding individual patterns from OR expression");
-                }
-                results.extend(left_patterns);
-                results.extend(right_patterns);
+                // For OR, just collect patterns from both sides independently
+                // Don't create complex nested patterns that can explode in size
+                collect_patterns(left, plan, results, debug_mode);
+                collect_patterns(right, plan, results, debug_mode);
             }
         }
     }
@@ -644,8 +660,9 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
         println!("DEBUG: Starting pattern deduplication");
     }
 
-    // First, deduplicate by exact pattern match
-    let mut pattern_map: HashMap<String, HashSet<usize>> = HashMap::new();
+    // First, deduplicate by exact pattern match using BTreeMap for deterministic iteration
+    let mut pattern_map: std::collections::BTreeMap<String, HashSet<usize>> =
+        std::collections::BTreeMap::new();
 
     for (pattern, indices) in results {
         pattern_map
@@ -654,10 +671,9 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
             .or_insert(indices);
     }
 
-    // Then, deduplicate patterns that match the same term
-    // For the test_pattern_deduplication test, we need to ensure we don't have
-    // multiple patterns for the same term with the same indices
-    let mut term_patterns: HashMap<String, Vec<(String, HashSet<usize>)>> = HashMap::new();
+    // Then, deduplicate patterns that match the same term using BTreeMap for deterministic iteration
+    let mut term_patterns: std::collections::BTreeMap<String, Vec<(String, HashSet<usize>)>> =
+        std::collections::BTreeMap::new();
 
     // Group patterns by the terms they match
     for (pattern, indices) in pattern_map.iter() {
@@ -676,17 +692,18 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
             .push((pattern.clone(), indices.clone()));
     }
 
-    // Keep only the most specific pattern for each term group
+    // Keep only the most specific patterns for each term group, sorted deterministically
     let mut deduplicated_results = Vec::new();
 
-    for (_, patterns) in term_patterns {
+    for (_, mut patterns) in term_patterns {
         if patterns.len() <= 2 {
             // If there are 1 or 2 patterns, keep them all
             deduplicated_results.extend(patterns);
         } else {
-            // If there are more than 2 patterns, keep only the first 2
-            // This is a simplification - in a real implementation, you might want
-            // to keep the most specific patterns based on some criteria
+            // Sort patterns by specificity: longer patterns first, then lexicographic
+            patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+
+            // Keep the 2 most specific patterns
             deduplicated_results.extend(patterns.into_iter().take(2));
         }
     }
@@ -704,14 +721,169 @@ pub fn create_structured_patterns(plan: &QueryPlan) -> Vec<(String, HashSet<usiz
         }
     }
 
+    // Sort the final results deterministically before applying limits
+    deduplicated_results.sort_by(|a, b| {
+        // Sort by smallest term index first, then by pattern length (longer first), then lexicographic
+        let min_index_a = a.1.iter().min().unwrap_or(&usize::MAX);
+        let min_index_b = b.1.iter().min().unwrap_or(&usize::MAX);
+
+        min_index_a
+            .cmp(min_index_b)
+            .then_with(|| b.0.len().cmp(&a.0.len()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Apply pattern limit to prevent regex size explosion
+    let limited_results = if deduplicated_results.len() > MAX_PATTERNS {
+        if debug_mode {
+            println!(
+                "DEBUG: Limiting patterns to {} (was {})",
+                MAX_PATTERNS,
+                deduplicated_results.len()
+            );
+        }
+        deduplicated_results
+            .into_iter()
+            .take(MAX_PATTERNS)
+            .collect()
+    } else {
+        deduplicated_results
+    };
+
     let total_duration = start_time.elapsed();
 
     if debug_mode {
         println!(
-            "DEBUG: Total structured pattern creation completed in {}",
+            "DEBUG: Total structured pattern creation completed in {} with {} patterns",
+            format_duration(total_duration),
+            limited_results.len()
+        );
+    }
+
+    limited_results
+} // Re-added function closing brace
+
+/// Create a query plan from an already parsed AST
+pub fn create_query_plan_from_ast(
+    ast: elastic_query::Expr,
+    exact: bool,
+) -> Result<QueryPlan, elastic_query::ParseError> {
+    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let start_time = Instant::now();
+
+    if debug_mode {
+        println!("DEBUG: Creating query plan from existing AST");
+    }
+
+    // Update AST for exact search if needed
+    let mut final_ast = ast;
+    if exact {
+        update_ast_exact(&mut final_ast);
+    }
+
+    // Extract terms from the AST
+    let mut all_terms = Vec::new();
+    let mut excluded_terms = HashSet::new();
+    collect_all_terms(&final_ast, &mut all_terms, &mut excluded_terms);
+
+    // Remove duplicates from all_terms
+    all_terms.sort();
+    all_terms.dedup();
+
+    // Build term index map
+    let mut term_indices = HashMap::new();
+    for (i, term) in all_terms.iter().enumerate() {
+        term_indices.insert(term.clone(), i);
+    }
+
+    // Collect required terms for optimization
+    let mut required_terms = HashSet::new();
+    collect_required_terms(&final_ast, &mut required_terms);
+
+    // Determine if this is a simple query for optimization
+    let is_simple_query = match &final_ast {
+        elastic_query::Expr::Term { excluded, .. } => !excluded && all_terms.len() == 1,
+        _ => false,
+    };
+
+    // Pre-compute AST metadata
+    let has_required_anywhere = final_ast.has_required_term();
+    let has_only_excluded_terms = final_ast.is_only_excluded_terms();
+
+    // Pre-compute required term indices
+    let required_terms_indices: HashSet<usize> = required_terms
+        .iter()
+        .filter_map(|term| term_indices.get(term).cloned())
+        .collect();
+
+    // PHASE 5 OPTIMIZATION: Pre-compute special case terms once
+    let mut special_case_indices = HashSet::new();
+    let mut special_case_terms_lower = HashMap::new();
+    for (term, &idx) in &term_indices {
+        if tokenization::is_special_case(term) {
+            special_case_indices.insert(idx);
+            special_case_terms_lower.insert(idx, term.to_lowercase());
+        }
+    }
+
+    // Create evaluation cache
+    let evaluation_cache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())));
+
+    let total_duration = start_time.elapsed();
+    if debug_mode {
+        println!(
+            "DEBUG: Query plan from AST completed in {}",
             format_duration(total_duration)
         );
     }
 
-    deduplicated_results
-} // Re-added function closing brace
+    Ok(QueryPlan {
+        ast: final_ast,
+        term_indices,
+        excluded_terms,
+        exact,
+        is_simple_query,
+        required_terms,
+        has_required_anywhere,
+        required_terms_indices,
+        has_only_excluded_terms,
+        evaluation_cache,
+        is_universal_query: false,
+        special_case_indices,
+        special_case_terms_lower,
+    })
+}
+
+/// Create a universal query plan that matches everything (used when all terms are filters)
+pub fn create_universal_query_plan() -> QueryPlan {
+    // Create a simple term that will match anything in the content
+    // Use common characters that will appear in almost any file
+    let keywords = vec![".".to_string()]; // Match any single character - will match almost everything
+    let universal_ast = elastic_query::Expr::Term {
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
+        keywords,
+        field: None,
+        required: false,
+        excluded: false,
+        exact: false,
+    };
+
+    let mut term_indices = HashMap::new();
+    term_indices.insert(".".to_string(), 0);
+
+    QueryPlan {
+        ast: universal_ast,
+        term_indices,
+        excluded_terms: HashSet::new(),
+        exact: false,
+        is_simple_query: true,
+        required_terms: HashSet::new(),
+        has_required_anywhere: false,
+        required_terms_indices: HashSet::new(),
+        has_only_excluded_terms: false,
+        evaluation_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap()))),
+        is_universal_query: true, // This is a universal query that should match all content
+        special_case_indices: HashSet::new(),
+        special_case_terms_lower: HashMap::new(),
+    }
+}

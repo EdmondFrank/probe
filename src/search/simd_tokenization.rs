@@ -118,6 +118,11 @@ pub fn simd_split_camel_case(s: &str) -> Vec<String> {
 /// SIMD-accelerated camelCase splitting with explicit configuration
 /// This is the thread-safe version that doesn't use environment variable manipulation
 pub fn simd_split_camel_case_with_config(s: &str, config: SimdConfig) -> Vec<String> {
+    // Check if this is a special case word that should never be split (e.g., exact search terms)
+    if crate::search::tokenization::is_special_case(s) {
+        return vec![s.to_lowercase()];
+    }
+
     // Use scalar fallback for short strings or non-ASCII
     if s.len() < SIMD_THRESHOLD || !s.is_ascii() {
         return scalar_split_camel_case(s);
@@ -157,7 +162,22 @@ pub fn simd_split_camel_case_with_config(s: &str, config: SimdConfig) -> Vec<Str
         }
     }
 
-    // Return original string if no boundaries found
+    // If no boundaries were found (result has single element = whole string),
+    // try compound word splitting for all-lowercase strings
+    if result.len() == 1 {
+        let lowercase = s.to_lowercase();
+        if s == lowercase && !s.contains('_') && s.len() > 3 {
+            // Check pre-computed compound splits cache
+            if let Some(cached_splits) =
+                crate::search::tokenization::PRECOMPUTED_COMPOUND_SPLITS.get(&lowercase)
+            {
+                return cached_splits.clone();
+            }
+            // Note: We don't use decompound here because it can produce unexpected results.
+            // The search pipeline has its own fallback via split_compound_word_for_filtering().
+        }
+    }
+
     if result.is_empty() {
         vec![s.to_lowercase()]
     } else {
@@ -268,6 +288,11 @@ pub fn scalar_split_camel_case(s: &str) -> Vec<String> {
     // This is the original implementation from tokenization.rs
     if s.is_empty() {
         return vec![];
+    }
+
+    // Check if this is a special case word that should never be split (e.g., exact search terms)
+    if crate::search::tokenization::is_special_case(s) {
+        return vec![s.to_lowercase()];
     }
 
     let mut result = Vec::new();

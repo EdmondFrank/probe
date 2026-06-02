@@ -26,7 +26,7 @@ impl LanguageImpl for RustLanguage {
     }
 
     fn is_acceptable_parent(&self, node: &Node) -> bool {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         // Check for standard Rust items
         if matches!(
@@ -62,7 +62,7 @@ impl LanguageImpl for RustLanguage {
             // Check if this token tree is inside a macro invocation
             if let Some(parent) = node.parent() {
                 if parent.kind() == "macro_invocation" {
-                    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+                    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
                     // For Rust property tests, we want to consider token trees inside macros
                     // as acceptable parents, especially for proptest! macros
@@ -96,7 +96,7 @@ impl LanguageImpl for RustLanguage {
     }
 
     fn is_test_node(&self, node: &Node, source: &[u8]) -> bool {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
         let node_type = node.kind();
 
         // Rust: Check for #[test] attribute on function_item nodes
@@ -137,5 +137,197 @@ impl LanguageImpl for RustLanguage {
         }
 
         false
+    }
+
+    fn get_symbol_signature(&self, node: &Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_item" => {
+                // Extract function signature without body
+                // Find the block node and extract everything before it
+                if let Some(block) = node.child_by_field_name("body") {
+                    let sig_end = block.start_byte();
+                    let sig = &source[node.start_byte()..sig_end];
+                    let sig_str = String::from_utf8_lossy(sig).trim().to_string();
+                    // Remove trailing { if present
+                    Some(sig_str.trim_end_matches('{').trim().to_string())
+                } else {
+                    // For function declarations without body
+                    let sig = &source[node.start_byte()..node.end_byte()];
+                    Some(String::from_utf8_lossy(sig).trim().to_string())
+                }
+            }
+            "struct_item" => {
+                // Extract struct signature
+                // For structs, we want the struct name and generic parameters
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut sig = String::new();
+
+                    // Add visibility if present
+                    if let Some(vis) = node.child_by_field_name("visibility") {
+                        let vis_text = &source[vis.start_byte()..vis.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(vis_text));
+                        sig.push(' ');
+                    }
+
+                    sig.push_str("struct ");
+                    let name_text = &source[name.start_byte()..name.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(name_text));
+
+                    // Add generic parameters if present
+                    if let Some(generics) = node.child_by_field_name("type_parameters") {
+                        let gen_text = &source[generics.start_byte()..generics.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(gen_text));
+                    }
+
+                    // Add field summary
+                    if let Some(body) = node.child_by_field_name("body") {
+                        if body.kind() == "field_declaration_list" {
+                            sig.push_str(" { ... }");
+                        }
+                    }
+
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            "impl_item" => {
+                // Extract impl signature
+                let mut sig = String::new();
+
+                // Check for impl keyword
+                sig.push_str("impl");
+
+                // Add generic parameters if present
+                if let Some(generics) = node.child_by_field_name("type_parameters") {
+                    let gen_text = &source[generics.start_byte()..generics.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(gen_text));
+                }
+
+                // Add type
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    sig.push(' ');
+                    let type_text = &source[type_node.start_byte()..type_node.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(type_text));
+                }
+
+                // Add trait if present (for trait implementations)
+                if let Some(trait_node) = node.child_by_field_name("trait") {
+                    sig.push_str(" for ");
+                    let trait_text = &source[trait_node.start_byte()..trait_node.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(trait_text));
+                }
+
+                sig.push_str(" { ... }");
+                Some(sig)
+            }
+            "trait_item" => {
+                // Extract trait signature
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut sig = String::new();
+
+                    // Add visibility if present
+                    if let Some(vis) = node.child_by_field_name("visibility") {
+                        let vis_text = &source[vis.start_byte()..vis.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(vis_text));
+                        sig.push(' ');
+                    }
+
+                    sig.push_str("trait ");
+                    let name_text = &source[name.start_byte()..name.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(name_text));
+
+                    // Add generic parameters if present
+                    if let Some(generics) = node.child_by_field_name("type_parameters") {
+                        let gen_text = &source[generics.start_byte()..generics.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(gen_text));
+                    }
+
+                    sig.push_str(" { ... }");
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            "enum_item" => {
+                // Extract enum signature
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut sig = String::new();
+
+                    // Add visibility if present
+                    if let Some(vis) = node.child_by_field_name("visibility") {
+                        let vis_text = &source[vis.start_byte()..vis.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(vis_text));
+                        sig.push(' ');
+                    }
+
+                    sig.push_str("enum ");
+                    let name_text = &source[name.start_byte()..name.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(name_text));
+
+                    // Add generic parameters if present
+                    if let Some(generics) = node.child_by_field_name("type_parameters") {
+                        let gen_text = &source[generics.start_byte()..generics.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(gen_text));
+                    }
+
+                    sig.push_str(" { ... }");
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            "const_item" | "static_item" => {
+                // Extract const/static signature without value
+                let sig = &source[node.start_byte()..node.end_byte()];
+                let sig_str = String::from_utf8_lossy(sig);
+
+                // Find the = and remove everything after it
+                if let Some(eq_pos) = sig_str.find('=') {
+                    Some(sig_str[..eq_pos].trim().to_string())
+                } else {
+                    Some(sig_str.trim().to_string())
+                }
+            }
+            "mod_item" => {
+                // Extract module signature
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut sig = String::new();
+
+                    // Add visibility if present
+                    if let Some(vis) = node.child_by_field_name("visibility") {
+                        let vis_text = &source[vis.start_byte()..vis.end_byte()];
+                        sig.push_str(&String::from_utf8_lossy(vis_text));
+                        sig.push(' ');
+                    }
+
+                    sig.push_str("mod ");
+                    let name_text = &source[name.start_byte()..name.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(name_text));
+
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            "macro_definition" => {
+                // Extract macro signature
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut sig = String::from("macro_rules! ");
+                    let name_text = &source[name.start_byte()..name.end_byte()];
+                    sig.push_str(&String::from_utf8_lossy(name_text));
+                    sig.push_str(" { ... }");
+                    Some(sig)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_symbol_node(&self, node: &Node) -> bool {
+        self.is_acceptable_parent(node)
+            || matches!(node.kind(), "const_item" | "static_item" | "type_item")
     }
 }

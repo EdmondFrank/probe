@@ -1,19 +1,19 @@
-# @buger/probe-chat
+# @probelabs/probe-chat
 
-A CLI chat interface for the [probe](https://github.com/buger/probe) code search tool.
+A CLI chat interface for the [probe](https://github.com/probelabs/probe) code search tool.
 
 ## Installation
 
 ### Global Installation (Recommended)
 
 ```bash
-npm install -g @buger/probe-chat
+npm install -g @probelabs/probe-chat
 ```
 
 ### Local Installation
 
 ```bash
-npm install @buger/probe-chat
+npm install @probelabs/probe-chat
 ```
 
 ## Features
@@ -50,7 +50,7 @@ You can configure the chat using environment variables:
 
 - `ANTHROPIC_API_KEY`: Your Anthropic API key
 - `OPENAI_API_KEY`: Your OpenAI API key
-- `MODEL_NAME`: The model to use (e.g., 'claude-3-7-sonnet-latest', 'gpt-4o-2024-05-13')
+- `MODEL_NAME`: The model to use (e.g., 'claude-3-7-sonnet-latest', 'gpt-5.2')
 - `ALLOWED_FOLDERS`: Comma-separated list of folders to search in
 - `DEBUG`: Set to 'true' to enable debug mode
 - `ANTHROPIC_API_URL`: Custom Anthropic API URL (optional)
@@ -69,7 +69,7 @@ While in the chat, you can use the following commands:
 You can also use the package programmatically in your Node.js applications:
 
 ```javascript
-import { ProbeChat, tools } from '@buger/probe-chat';
+import { ProbeChat, tools } from '@probelabs/probe-chat';
 
 // Create a new chat instance
 const chat = new ProbeChat({
@@ -98,7 +98,7 @@ chat.clearHistory();
 ### ProbeChat Class
 
 ```javascript
-import { ProbeChat } from '@buger/probe-chat';
+import { ProbeChat } from '@probelabs/probe-chat';
 
 // Create a new chat instance
 const chat = new ProbeChat(options);
@@ -123,10 +123,10 @@ const chat = new ProbeChat(options);
 
 ### Tools
 
-The package also exports the tools from `@buger/probe` for convenience:
+The package also exports the tools from `@probelabs/probe` for convenience:
 
 ```javascript
-import { tools } from '@buger/probe-chat';
+import { tools } from '@probelabs/probe-chat';
 
 // Access the tools
 const { searchTool, queryTool, extractTool } = tools;
@@ -140,15 +140,15 @@ const systemMessage = tools.DEFAULT_SYSTEM_MESSAGE;
 ### Anthropic Models
 - `claude-3-7-sonnet-latest` (default)
 - `claude-3-7-opus-latest`
-- `claude-3-5-sonnet-20241022`
-- `claude-3-5-sonnet-20240620`
+- `claude-sonnet-4-6`
+- `claude-sonnet-4-6`
 - `claude-3-opus-20240229`
 - `claude-3-sonnet-20240229`
 - `claude-3-haiku-20240307`
 
 ### OpenAI Models
-- `gpt-4o-2024-05-13` (default)
-- `gpt-4o`
+- `gpt-5.2` (default)
+- `gpt-5.2`
 - `gpt-4-turbo`
 - `gpt-4`
 
@@ -163,6 +163,6 @@ ISC
 
 ## Related Projects
 
-- [probe](https://github.com/buger/probe) - The core probe code search tool
-- [@buger/probe](https://www.npmjs.com/package/@buger/probe) - Node.js wrapper for the probe tool
+- [probe](https://github.com/probelabs/probe) - The core probe code search tool
+- [@probelabs/probe](https://www.npmjs.com/package/@probelabs/probe) - Node.js wrapper for the probe tool
 - [Vercel AI SDK](https://sdk.vercel.ai/) - The AI SDK used for model integration 

@@ -11,13 +11,13 @@ fn test_deduplication_of_nested_extractions() {
     let content = r#"
 fn outer_function() {
     let x = 10;
-    
+
     // This is a nested function that should be deduplicated
     fn inner_function() {
         let y = 20;
         println!("Inner function: {}", y);
     }
-    
+
     // Call the inner function
     inner_function();
     println!("Outer function: {}", x);
@@ -52,6 +52,7 @@ fn standalone_function() {
         prompt: None,
         instructions: None,
         no_gitignore: false,
+        lsp: false,
     };
 
     // Call handle_extract
@@ -73,13 +74,13 @@ fn test_deduplication_with_command_line_integration() {
     let content = r#"
 fn outer_function() {
     let x = 10;
-    
+
     // This is a nested function that should be deduplicated
     fn inner_function() {
         let y = 20;
         println!("Inner function: {}", y);
     }
-    
+
     // Call the inner function
     inner_function();
     println!("Outer function: {}", x);
@@ -123,9 +124,11 @@ fn standalone_function() {
     println!("Command stdout: {stdout}");
     println!("Command stderr: {stderr}");
 
-    // Check for deduplication logs in stdout (not stderr)
+    // Check for deduplication logs (may appear on stderr when using `cargo run`)
     assert!(
-        stdout.contains("Before deduplication:") && stdout.contains("After deduplication:"),
+        (stdout.contains("Before deduplication:") && stdout.contains("After deduplication:"))
+            || (stderr.contains("Before deduplication:")
+                && stderr.contains("After deduplication:")),
         "Deduplication logs not found in output"
     );
 

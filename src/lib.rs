@@ -1,6 +1,7 @@
 //! # Probe
 //!
 //! Probe is an AI-friendly, fully local, semantic code search tool for large codebases.
+#![allow(dead_code, clippy::all)]
 //!
 //! This crate provides both a command-line interface and a library that can be used
 //! programmatically in other Rust applications.
@@ -65,6 +66,8 @@
 //!     keep_input: false,
 //!     prompt: None,
 //!     instructions: None,
+//!     no_gitignore: false,
+//!     lsp: false,
 //! };
 //!
 //! handle_extract(options).unwrap();
@@ -80,11 +83,13 @@
 //! let options = QueryOptions {
 //!     path: Path::new("."),
 //!     pattern: "fn $NAME($$$PARAMS) { $$$BODY }",
-//!     language: Some("rust".to_string()),
+//!     language: Some("rust"),
 //!     ignore: &[],
 //!     allow_tests: false,
 //!     max_results: None,
-//!     format: "text".to_string(),
+//!     with_context: false,
+//!     format: "text",
+//!     no_gitignore: false,
 //! };
 //!
 //! let matches = perform_query(&options).unwrap();
@@ -95,15 +100,20 @@
 extern crate self as probe_code;
 
 pub mod bert_reranker;
+pub mod config;
 pub mod extract;
 pub mod language;
+pub mod lsp_integration;
 pub mod models;
 pub mod path_resolver;
+pub mod path_safety;
 pub mod query;
 pub mod ranking;
 pub mod search;
+pub mod semantic_context;
 pub mod simd_ranking;
 pub mod simd_test;
+pub mod utils;
 pub mod version;
 
 // Re-export commonly used types for convenience

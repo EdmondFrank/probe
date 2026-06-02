@@ -6,6 +6,7 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { getBinaryPath, buildCliArgs, escapeString } from './utils.js';
+import { validateCwdPath } from './utils/path-validation.js';
 
 const execAsync = promisify(exec);
 
@@ -17,6 +18,7 @@ const QUERY_FLAG_MAP = {
 	language: '--language',
 	ignore: '--ignore',
 	allowTests: '--allow-tests',
+	withContext: '--with-context',
 	maxResults: '--max-results',
 	format: '--format'
 };
@@ -26,10 +28,12 @@ const QUERY_FLAG_MAP = {
  * 
  * @param {Object} options - Query options
  * @param {string} options.path - Path to search in
+ * @param {string} [options.cwd] - Working directory for resolving relative paths (defaults to process.cwd())
  * @param {string} options.pattern - The ast-grep pattern to search for
  * @param {string} [options.language] - Programming language to search in
  * @param {string[]} [options.ignore] - Patterns to ignore
  * @param {boolean} [options.allowTests] - Include test files
+ * @param {boolean} [options.withContext] - Include owning source-block context in JSON output
  * @param {number} [options.maxResults] - Maximum number of results
  * @param {string} [options.format] - Output format ('markdown', 'plain', 'json', 'color')
  * @param {Object} [options.binaryOptions] - Options for getting the binary
@@ -62,18 +66,25 @@ export async function query(options) {
 	// Add pattern and path as positional arguments
 	cliArgs.push(escapeString(options.pattern), escapeString(options.path));
 
-	// Create a single log record with all query parameters
-	let logMessage = `Query: pattern="${options.pattern}" path="${options.path}"`;
-	if (options.language) logMessage += ` language=${options.language}`;
-	if (options.maxResults) logMessage += ` maxResults=${options.maxResults}`;
-	if (options.allowTests) logMessage += " allowTests=true";
-	console.error(logMessage);
+	// Get the working directory (cwd option for resolving relative paths)
+	// Validate and normalize the path to prevent path traversal attacks
+	const cwd = await validateCwdPath(options.cwd);
+
+	// Create a single log record with all query parameters (only in debug mode)
+	if (process.env.DEBUG === '1') {
+		let logMessage = `Query: pattern="${options.pattern}" path="${options.path}"`;
+		if (options.cwd) logMessage += ` cwd="${options.cwd}"`;
+		if (options.language) logMessage += ` language=${options.language}`;
+		if (options.maxResults) logMessage += ` maxResults=${options.maxResults}`;
+		if (options.allowTests) logMessage += " allowTests=true";
+		console.error(logMessage);
+	}
 
 	// Execute command
 	const command = `${binaryPath} query ${cliArgs.join(' ')}`;
 
 	try {
-		const { stdout, stderr } = await execAsync(command);
+		const { stdout, stderr } = await execAsync(command, { cwd });
 
 		if (stderr) {
 			console.error(`stderr: ${stderr}`);
@@ -90,8 +101,10 @@ export async function query(options) {
 			}
 		}
 
-		// Log the results count
-		console.error(`Query results: ${resultCount} matches`);
+		// Log the results count (only in debug mode)
+		if (process.env.DEBUG === '1') {
+			console.error(`Query results: ${resultCount} matches`);
+		}
 
 		// Parse JSON if requested or if format is json
 		if (options.json || options.format === 'json') {
@@ -106,7 +119,7 @@ export async function query(options) {
 		return stdout;
 	} catch (error) {
 		// Enhance error message with command details
-		const errorMessage = `Error executing query command: ${error.message}\nCommand: ${command}`;
+		const errorMessage = `Error executing query command: ${error.message}\nCommand: ${command}\nCwd: ${cwd}`;
 		throw new Error(errorMessage);
 	}
 }

@@ -27,6 +27,7 @@ mod tests {
             timeout: 30,
             question: None,
             no_gitignore: false,
+            lsp: false,
         };
 
         let results = perform_probe(&options).unwrap();
@@ -47,6 +48,7 @@ mod tests {
             ignore: &[],
             allow_tests: true,
             max_results: Some(5),
+            with_context: false,
             format: "text",
             no_gitignore: false,
         };

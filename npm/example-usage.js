@@ -1,6 +1,6 @@
 // Example of using the probe npm package in Node.js
 
-import { search, query, extract, tools } from '@buger/probe';
+import { search, query, extract, tools } from '@probelabs/probe';
 
 // Basic search example
 async function basicSearchExample() {
@@ -262,7 +262,7 @@ async function langchainToolsExample() {
 		console.log(`
 async function chatWithAI(userMessage) {
   const model = new ChatOpenAI({
-    modelName: "gpt-4o",
+    modelName: "gpt-5.2",
     temperature: 0.7
   }).withTools([searchTool, queryTool, extractTool]);
   
@@ -305,7 +305,7 @@ const result = await generateText({
 
 // Example with LangChain
 const model = new ChatOpenAI({
-  modelName: "gpt-4o",
+  modelName: "gpt-5.2",
   temperature: 0.7
 }).withTools([searchTool, queryTool, extractTool]);
 

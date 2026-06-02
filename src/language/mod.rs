@@ -4,6 +4,7 @@
 // Import submodules
 pub mod block_handling;
 pub mod common;
+pub mod crystal;
 pub mod factory;
 pub mod language_trait;
 pub mod parser;
@@ -16,14 +17,18 @@ pub mod c;
 pub mod cpp;
 pub mod csharp;
 pub mod go;
+pub mod html;
 pub mod java;
 pub mod javascript;
+pub mod markdown;
 pub mod php;
 pub mod python;
 pub mod ruby;
 pub mod rust;
+pub mod solidity;
 pub mod swift;
 pub mod typescript;
+pub mod yaml;
 
 // Re-export items for backward compatibility
 pub use parser::{parse_file_for_code_blocks, parse_file_for_code_blocks_with_tree};

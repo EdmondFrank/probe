@@ -34,7 +34,7 @@ fn assert_parse_eq_with_stemming(input: &str, expected: Expr) {
                         },
                         _ => assert_eq!(**left1, **left2, "Left sides don't match for input: {input}"),
                     }
-                    
+
                     // Compare the right sides
                     match (&**right1, &**right2) {
                         (Expr::Term { keywords: kw1, .. }, Expr::Term { keywords: kw2, .. }) => {
@@ -61,14 +61,14 @@ fn assert_parse_fails(input: &str) {
     let should_fail = input.trim().is_empty() ||
                       input == "()" ||
                       input == "AND OR"; // Only operators without identifiers
-    
+
     if should_fail {
         if let Ok(expr) = parse_query_test(input) {
             panic!("Expected parsing to fail for input: '{input}', but got: {expr:?}");
         }
         return;
     }
-    
+
     // For other previously invalid queries, we now expect them to be parsed successfully
     // The parser will extract valid identifiers and create a Term or expression
     match parse_query_test(input) {
@@ -85,8 +85,10 @@ fn assert_parse_fails(input: &str) {
 
 // Helper functions to create common expressions
 fn term(keyword: &str) -> Expr {
+    let keywords = vec![keyword.to_string()];
     Expr::Term {
-        keywords: vec![keyword.to_string()],
+        keywords: keywords.clone(),
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
         field: None,
         required: false,
         excluded: false,
@@ -95,8 +97,10 @@ fn term(keyword: &str) -> Expr {
 }
 
 fn required_term(keyword: &str) -> Expr {
+    let keywords = vec![keyword.to_string()];
     Expr::Term {
-        keywords: vec![keyword.to_string()],
+        keywords: keywords.clone(),
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
         field: None,
         required: true,
         excluded: false,
@@ -105,8 +109,10 @@ fn required_term(keyword: &str) -> Expr {
 }
 
 fn excluded_term(keyword: &str) -> Expr {
+    let keywords = vec![keyword.to_string()];
     Expr::Term {
-        keywords: vec![keyword.to_string()],
+        keywords: keywords.clone(),
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
         field: None,
         required: false,
         excluded: true,
@@ -116,8 +122,10 @@ fn excluded_term(keyword: &str) -> Expr {
 
 #[allow(dead_code)]
 fn exact_term(keyword: &str) -> Expr {
+    let keywords = vec![keyword.to_string()];
     Expr::Term {
-        keywords: vec![keyword.to_string()],
+        keywords: keywords.clone(),
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
         field: None,
         required: false,
         excluded: false,
@@ -143,22 +151,22 @@ fn test_term_extraction() {
     assert_terms_eq("foo", vec![], vec!["foo"]);
     assert_terms_eq("+foo", vec!["foo"], vec![]);
     assert_terms_eq("-foo", vec![], vec![]);
-    
+
     // Multiple terms - treated as OR (Lucene semantics)
     assert_terms_eq("foo bar", vec![], vec!["foo", "bar"]);
     assert_terms_eq("+foo +bar", vec!["foo", "bar"], vec![]);
     assert_terms_eq("+foo bar", vec!["foo"], vec!["bar"]);
-    
+
     // Mixed required and optional with excluded
     assert_terms_eq("+foo bar -baz", vec!["foo"], vec!["bar"]);
     assert_terms_eq("foo +bar +baz", vec!["bar", "baz"], vec!["foo"]);
     assert_terms_eq("-foo bar", vec![], vec!["bar"]);
-    
+
     // With boolean operators
     assert_terms_eq("foo AND +bar", vec!["bar"], vec!["foo"]);
     assert_terms_eq("+foo OR bar", vec!["foo"], vec!["bar"]);
     assert_terms_eq("foo OR -bar AND baz", vec![], vec!["foo", "baz"]);
-    
+
     // Complex expressions
     assert_terms_eq(
         "(+foo -bar) AND (baz OR +qux)",
@@ -176,10 +184,10 @@ fn test_term_extraction() {
 fn test_single_terms() {
     // Basic term
     assert_parse_eq("foo", term("foo"));
-    
+
     // Required term
     assert_parse_eq("+foo", required_term("foo"));
-    
+
     // Excluded term
     assert_parse_eq("-foo", excluded_term("foo"));
 }
@@ -207,19 +215,19 @@ fn test_multiple_terms_implicit_combinations() {
             Box::new(term("baz"))
         )
     );
-    
+
     // Multiple required terms use AND when explicit + on each
     assert_parse_eq(
         "+foo +bar",
         Expr::And(Box::new(required_term("foo")), Box::new(required_term("bar")))
     );
-    
+
     // Mixed required and excluded use AND for modifier combinations
     assert_parse_eq(
         "+foo -bar",
         Expr::And(Box::new(required_term("foo")), Box::new(excluded_term("bar")))
     );
-    
+
     // Three terms with excluded - using OR for implicit combinations
     assert_parse_eq(
         "-foo bar baz",
@@ -414,11 +422,11 @@ fn test_mixed_prefixes_and_operators() {
         } else {
             panic!("Expected Or expression for right side");
         }
-        
+
         // Check the left side structure
         if let Expr::Or(left_left, left_right) = *left {
             assert_eq!(*left_right, term("baz"));
-            
+
             // The first part should be And with the new implementation
             if let Expr::And(and_left, and_right) = *left_left {
                 assert_eq!(*and_left, required_term("foo"));
@@ -451,20 +459,20 @@ fn test_edge_cases() {
     // Empty inputs
     assert_parse_fails("");
     assert_parse_fails("   ");
-    
+
     // Unbalanced parentheses
     assert_parse_fails("(foo AND bar");
     assert_parse_fails("foo AND bar)");
-    
+
     // Unknown symbols
     assert_parse_fails("foo & bar");
-    
+
     // Trailing tokens are treated as implicit OR
     assert_parse_eq(
         "(foo) some_extra",
         Expr::Or(Box::new(term("foo")), Box::new(term("extra")))  // Changed "some_extra" to "extra"
     );
-    
+
     // Empty parentheses
     assert_parse_fails("()");
 }
@@ -524,7 +532,7 @@ fn test_stop_word_removal() {
     // Test that stop words like "type" are properly removed from queries
     // "type" is a programming stop word, so "JWT AND type" should be parsed as just "JWT"
     let result = parse_query_test("JWT AND type").unwrap();
-    
+
     // The result should be a Term with just "JWT" as the keyword
     match result {
         Expr::Term { keywords, .. } => {
@@ -554,4 +562,203 @@ fn test_invalid_queries() {
     assert_parse_fails("foo AND AND bar"); // Multiple ANDs
     assert_parse_fails("++foo"); // Multiple prefixes
     assert_parse_fails("AND OR"); // Only operators
+}
+
+#[test]
+fn test_quoted_strings() {
+    // Basic quoted string
+    let keywords1 = vec!["find_config_file".to_string()];
+    assert_parse_eq(
+        "\"find_config_file\"",
+        Expr::Term {
+            keywords: keywords1.clone(),
+            lowercase_keywords: keywords1.iter().map(|k| k.to_lowercase()).collect(),
+            field: None,
+            required: false,
+            excluded: false,
+            exact: true,
+        }
+    );
+
+    // Quoted string with underscores and special characters
+    let keywords2 = vec!["discover_config".to_string()];
+    assert_parse_eq(
+        "\"discover_config\"",
+        Expr::Term {
+            keywords: keywords2.clone(),
+            lowercase_keywords: keywords2.iter().map(|k| k.to_lowercase()).collect(),
+            field: None,
+            required: false,
+            excluded: false,
+            exact: true,
+        }
+    );
+
+    // Multiple quoted strings with OR
+    let keywords3 = vec!["find_config_file".to_string()];
+    let keywords4 = vec!["discover_config".to_string()];
+    assert_parse_eq(
+        "\"find_config_file\" OR \"discover_config\"",
+        Expr::Or(
+            Box::new(Expr::Term {
+                keywords: keywords3.clone(),
+                lowercase_keywords: keywords3.iter().map(|k| k.to_lowercase()).collect(),
+                field: None,
+                required: false,
+                excluded: false,
+                exact: true,
+            }),
+            Box::new(Expr::Term {
+                keywords: keywords4.clone(),
+                lowercase_keywords: keywords4.iter().map(|k| k.to_lowercase()).collect(),
+                field: None,
+                required: false,
+                excluded: false,
+                exact: true,
+            })
+        )
+    );
+
+    // User's specific query pattern - complex OR with multiple quoted terms
+    let keywords5 = vec!["find_config_file".to_string()];
+    let keywords6 = vec!["discover_config".to_string()];
+    let keywords7 = vec!["load_config_files".to_string()];
+    assert_parse_eq(
+        "\"find_config_file\" OR \"discover_config\" OR \"load_config_files\"",
+        Expr::Or(
+            Box::new(Expr::Or(
+                Box::new(Expr::Term {
+                    keywords: keywords5.clone(),
+                    lowercase_keywords: keywords5.iter().map(|k| k.to_lowercase()).collect(),
+                    field: None,
+                    required: false,
+                    excluded: false,
+                    exact: true,
+                }),
+                Box::new(Expr::Term {
+                    keywords: keywords6.clone(),
+                    lowercase_keywords: keywords6.iter().map(|k| k.to_lowercase()).collect(),
+                    field: None,
+                    required: false,
+                    excluded: false,
+                    exact: true,
+                })
+            )),
+            Box::new(Expr::Term {
+                keywords: keywords7.clone(),
+                lowercase_keywords: keywords7.iter().map(|k| k.to_lowercase()).collect(),
+                field: None,
+                required: false,
+                excluded: false,
+                exact: true,
+            })
+        )
+    );
+
+    // Required quoted string
+    let keywords8 = vec!["required_function".to_string()];
+    assert_parse_eq(
+        "+\"required_function\"",
+        Expr::Term {
+            keywords: keywords8.clone(),
+            lowercase_keywords: keywords8.iter().map(|k| k.to_lowercase()).collect(),
+            field: None,
+            required: true,
+            excluded: false,
+            exact: true,
+        }
+    );
+
+    // Excluded quoted string
+    let keywords9 = vec!["excluded_function".to_string()];
+    assert_parse_eq(
+        "-\"excluded_function\"",
+        Expr::Term {
+            keywords: keywords9.clone(),
+            lowercase_keywords: keywords9.iter().map(|k| k.to_lowercase()).collect(),
+            field: None,
+            required: false,
+            excluded: true,
+            exact: true,
+        }
+    );
+
+    // Field-specific quoted string
+    let keywords10 = vec!["exact_value".to_string()];
+    assert_parse_eq(
+        "field:\"exact_value\"",
+        Expr::Term {
+            keywords: keywords10.clone(),
+            lowercase_keywords: keywords10.iter().map(|k| k.to_lowercase()).collect(),
+            field: Some("field".to_string()),
+            required: false,
+            excluded: false,
+            exact: true,
+        }
+    );
+
+    let namespaced = parse_query_test("HTTP::Server AND lang:crystal").unwrap();
+    match namespaced {
+        Expr::And(left, right) => {
+            match *left {
+                Expr::Term {
+                    keywords, field, ..
+                } => {
+                    assert_eq!(field, None);
+                    assert_eq!(keywords, vec!["http".to_string(), "server".to_string()]);
+                }
+                other => panic!("expected namespaced term on left, got {other:?}"),
+            }
+
+            match *right {
+                Expr::Term {
+                    keywords, field, ..
+                } => {
+                    assert_eq!(field, Some("lang".to_string()));
+                    assert_eq!(keywords, vec!["crystal".to_string()]);
+                }
+                other => panic!("expected lang field term on right, got {other:?}"),
+            }
+        }
+        other => panic!("expected AND expression for namespaced query, got {other:?}"),
+    }
+
+    // Quoted string with escaped quotes
+    let keywords11 = vec!["function_with_\"quotes\"".to_string()];
+    assert_parse_eq(
+        "\"function_with_\\\"quotes\\\"\"",
+        Expr::Term {
+            keywords: keywords11.clone(),
+            lowercase_keywords: keywords11.iter().map(|k| k.to_lowercase()).collect(),
+            field: None,
+            required: false,
+            excluded: false,
+            exact: true,
+        }
+    );
+
+    // Mixed quoted and unquoted terms
+    let keywords12 = vec!["regular".to_string(), "term".to_string()];
+    let keywords13 = vec!["exact_term".to_string()];
+    assert_parse_eq(
+        "regular_term AND \"exact_term\"",
+        Expr::And(
+            Box::new(Expr::Term {
+                keywords: keywords12.clone(),
+                lowercase_keywords: keywords12.iter().map(|k| k.to_lowercase()).collect(),
+                field: None,
+                required: false,
+                excluded: false,
+                exact: false,
+            }),
+            Box::new(Expr::Term {
+                keywords: keywords13.clone(),
+                lowercase_keywords: keywords13.iter().map(|k| k.to_lowercase()).collect(),
+                field: None,
+                required: false,
+                excluded: false,
+                exact: true,
+            })
+        )
+    );
 }

@@ -5,7 +5,7 @@ import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import { ProbeChat } from './probeChat.js';
+import { ChatSessionManager } from './ChatSessionManager.js';
 import { TokenUsageDisplay } from './tokenUsageDisplay.js';
 import { authMiddleware, withAuth } from './auth.js';
 import {
@@ -13,7 +13,6 @@ import {
 	searchToolInstance, // Keep direct instances for API endpoints
 	queryToolInstance,
 	extractToolInstance,
-	implementToolInstance,
 	toolCallEmitter,
 	cancelToolExecutions,
 	clearToolExecutionData,
@@ -32,7 +31,7 @@ let globalStorage = null;
 const chatSessions = new Map();
 
 /**
- * Retrieve or create a ProbeChat instance keyed by sessionId.
+ * Retrieve or create a ChatSessionManager instance keyed by sessionId.
  */
 function getOrCreateChat(sessionId, apiCredentials = null) {
 	if (!sessionId) {
@@ -54,24 +53,19 @@ function getOrCreateChat(sessionId, apiCredentials = null) {
 	}
 
 	// Create options object with sessionId and API credentials if provided
-	const options = { sessionId };
+	const options = { 
+		sessionId,
+		storage: globalStorage,
+		debug: process.env.DEBUG_CHAT === '1'
+	};
+	
 	if (apiCredentials) {
 		options.apiProvider = apiCredentials.apiProvider;
 		options.apiKey = apiCredentials.apiKey;
 		options.apiUrl = apiCredentials.apiUrl;
 	}
-	
-	// Pass storage instance for persistent storage
-	if (globalStorage) {
-		options.storage = globalStorage;
-	}
 
-	const newChat = new ProbeChat(options);
-	
-	// Add timestamps for session tracking
-	const now = Date.now();
-	newChat.createdAt = now;
-	newChat.lastActivity = now;
+	const newChat = new ChatSessionManager(options);
 	
 	// Store in memory cache
 	chatSessions.set(sessionId, newChat);
@@ -80,8 +74,8 @@ function getOrCreateChat(sessionId, apiCredentials = null) {
 	if (globalStorage) {
 		globalStorage.saveSession({
 			id: sessionId,
-			createdAt: now,
-			lastActivity: now,
+			createdAt: newChat.createdAt,
+			lastActivity: newChat.lastActivity,
 			firstMessagePreview: null, // Will be updated when first message is sent
 			metadata: {
 				apiProvider: apiCredentials?.apiProvider || null
@@ -92,7 +86,7 @@ function getOrCreateChat(sessionId, apiCredentials = null) {
 	}
 	
 	if (process.env.DEBUG_CHAT === '1') {
-		console.log(`[DEBUG] Created and stored new chat instance for session: ${sessionId}. Total sessions: ${chatSessions.size}`);
+		console.log(`[DEBUG] Created and stored new ChatSessionManager instance for session: ${sessionId}. Total sessions: ${chatSessions.size}`);
 		if (apiCredentials && apiCredentials.apiKey) {
 			console.log(`[DEBUG] Chat instance created with client-provided API credentials (provider: ${apiCredentials.apiProvider})`);
 		}
@@ -103,15 +97,14 @@ function getOrCreateChat(sessionId, apiCredentials = null) {
 /**
  * Start the web server
  * @param {string} version - The version of the application
- * @param {boolean} hasApiKeys - Whether any API keys are configured
  * @param {Object} options - Additional options
- * @param {boolean} options.allowEdit - Whether to allow editing files via the implement tool
+ * @param {boolean} options.allowEdit - Whether to allow editing files
  */
-export function startWebServer(version, hasApiKeys = true, options = {}) {
+export async function startWebServer(version, options = {}) {
 	const allowEdit = options?.allowEdit || false;
-	
+
 	if (allowEdit) {
-		console.log('Edit mode enabled: implement tool is available');
+		console.log('Edit mode enabled');
 	}
 	// Authentication configuration
 	const AUTH_ENABLED = process.env.AUTH_ENABLED === '1';
@@ -125,21 +118,19 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 	}
 
 	// Initialize persistent storage for web mode
-	globalStorage = new JsonChatStorage({ 
-		webMode: true, 
-		verbose: process.env.DEBUG_CHAT === '1' 
+	globalStorage = new JsonChatStorage({
+		webMode: true,
+		verbose: process.env.DEBUG_CHAT === '1'
 	});
-	
-	// Initialize storage asynchronously
-	(async () => {
-		try {
-			await globalStorage.initialize();
-			const stats = await globalStorage.getStats();
-			console.log(`Chat history storage: ${stats.storage_type} (${stats.session_count} sessions, ${stats.visible_message_count} messages)`);
-		} catch (error) {
-			console.warn('Failed to initialize chat history storage:', error.message);
-		}
-	})();
+
+	// Initialize storage synchronously before server starts
+	try {
+		await globalStorage.initialize();
+		const stats = await globalStorage.getStats();
+		console.log(`Chat history storage: ${stats.storage_type} (${stats.session_count} sessions, ${stats.visible_message_count} messages)`);
+	} catch (error) {
+		console.warn('Failed to initialize chat history storage:', error.message);
+	}
 
 	// Map to store SSE clients by session ID
 	const sseClients = new Map();
@@ -151,13 +142,9 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 		? process.env.ALLOWED_FOLDERS.split(',').map(folder => folder.trim()).filter(Boolean)
 		: [];
 
-
-	let noApiKeysMode = !hasApiKeys;
-	if (noApiKeysMode) {
-		console.log('Running in No API Keys mode - will show setup instructions to users');
-	} else {
-		console.log('API keys detected. Chat functionality enabled.');
-	}
+	// Note: API key / CLI availability is checked lazily in ProbeAgent.initialize()
+	// when the first chat message is sent. This allows fallback to Claude Code or Codex CLI.
+	console.log('Chat functionality enabled (API availability checked on first message)');
 
 
 	// Define the tools available for direct API calls (bypassing LLM loop)
@@ -167,12 +154,6 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 		query: queryToolInstance,
 		extract: extractToolInstance
 	};
-	
-	// Add implement tool if edit mode is enabled
-	if (allowEdit) {
-		directApiTools.implement = implementToolInstance;
-	}
-
 
 	// Helper function to send SSE data
 	function sendSSEData(res, data, eventType = 'message') {
@@ -226,7 +207,6 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 			'OPTIONS /api/search': (req, res) => handleOptions(res),
 			'OPTIONS /api/query': (req, res) => handleOptions(res),
 			'OPTIONS /api/extract': (req, res) => handleOptions(res),
-			'OPTIONS /api/implement': (req, res) => handleOptions(res),
 			'OPTIONS /cancel-request': (req, res) => handleOptions(res),
 			'OPTIONS /folders': (req, res) => handleOptions(res), // Added for /folders
 
@@ -426,7 +406,7 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 			// UI Routes
 			'GET /': (req, res) => {
 				const htmlPath = join(__dirname, 'index.html');
-				serveHtml(res, htmlPath, { 'data-no-api-keys': noApiKeysMode ? 'true' : 'false' });
+				serveHtml(res, htmlPath, { 'data-no-api-keys': 'false' });
 			},
 
 			// Chat session route - serves HTML with injected session ID
@@ -435,15 +415,15 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 				if (!sessionId) {
 					return sendError(res, 400, 'Invalid session ID in URL');
 				}
-				
+
 				// Validate that session exists or at least has a valid UUID format
 				if (!isValidUUID(sessionId)) {
 					return sendError(res, 400, 'Invalid session ID format');
 				}
 
 				const htmlPath = join(__dirname, 'index.html');
-				serveHtml(res, htmlPath, { 
-					'data-no-api-keys': noApiKeysMode ? 'true' : 'false',
+				serveHtml(res, htmlPath, {
+					'data-no-api-keys': 'false',
 					'data-session-id': sessionId
 				});
 			},
@@ -458,7 +438,7 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 				sendJson(res, 200, {
 					folders: folders,
 					currentDir: currentDir,
-					noApiKeysMode: noApiKeysMode
+					noApiKeysMode: false
 				});
 			},
 
@@ -653,24 +633,6 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 				});
 			},
 			
-			// Implement tool endpoint (only available if allowEdit is true)
-			'POST /api/implement': async (req, res) => {
-				// Check if edit mode is enabled
-				if (!directApiTools.implement) {
-					return sendError(res, 403, 'Implement tool is not enabled. Start server with --allow-edit to enable.');
-				}
-				
-				handlePostRequest(req, res, async (body) => {
-					const { task, sessionId: reqSessionId } = body;
-					if (!task) return sendError(res, 400, 'Missing required parameter: task');
-
-					const sessionId = reqSessionId || randomUUID();
-					const toolParams = { task, sessionId };
-
-					await executeDirectTool(res, directApiTools.implement, 'implement', toolParams, sessionId);
-				});
-			},
-
 			// --- Main Chat Endpoint (Handles the Loop) ---
 			'POST /chat': (req, res) => { // This is the route used by the frontend UI
 				handlePostRequest(req, res, async (requestData) => {
@@ -706,12 +668,6 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 
 					// Update last activity timestamp
 					chatInstance.lastActivity = Date.now();
-
-					// Check if API keys are needed but missing
-					if (chatInstance.noApiKeysMode) {
-						console.warn(`[WARN] Chat request for session ${chatSessionId} cannot proceed: No API keys configured.`);
-						return sendError(res, 503, 'Chat service unavailable: API key not configured on server.');
-					}
 
 					// Register this request as active for cancellation
 					registerRequest(chatSessionId, { abort: () => chatInstance.abort() });
@@ -763,9 +719,9 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 					// The loop is inside chatInstance.chat now.
 					// We expect the *final* result string back.
 					try {
-						// Pass API credentials to the chat method if provided
-						const apiCredentials = apiKey ? { apiProvider, apiKey, apiUrl } : null;
-						const result = await chatInstance.chat(message, chatSessionId, apiCredentials, images); // Pass session ID, API credentials, and images
+						// ChatSessionManager handles session ID and API credentials internally
+						// Only pass the message and images
+						const result = await chatInstance.chat(message, images);
 
 						// Check if cancelled *during* the chat call (ProbeChat throws error)
 						// Error handled in catch block
@@ -925,9 +881,6 @@ export function startWebServer(version, hasApiKeys = true, options = {}) {
 		console.log(`Probe Web Interface v${version}`);
 		console.log(`Server running on http://localhost:${PORT}`);
 		console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-		if (noApiKeysMode) {
-			console.log('*** Running in NO API KEYS mode. Chat functionality disabled. ***');
-		}
 	});
 }
 

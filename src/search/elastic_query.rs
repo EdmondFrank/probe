@@ -19,12 +19,14 @@ fn compute_evaluation_key(matched_terms: &HashSet<usize>) -> u64 {
 pub enum Expr {
     /// A search term, which can represent multiple keywords.
     /// `keywords` => a list of keywords (possibly tokenized/split)
+    /// `lowercase_keywords` => pre-computed lowercase versions for case-insensitive matching (computed once at parse time)
     /// `field` => optional field specifier (e.g. `Some("title")` for `title:foo`)
     /// `required` => a leading `+`
     /// `excluded` => a leading `-`
     /// `exact` => if originally quoted, meaning "no tokenization/splitting"
     Term {
         keywords: Vec<String>,
+        lowercase_keywords: Vec<String>,
         field: Option<String>,
         required: bool,
         excluded: bool,
@@ -111,14 +113,14 @@ impl Expr {
     ) -> bool {
         match self {
             Expr::Term {
-                keywords,
+                lowercase_keywords,
                 required,
                 excluded,
                 ..
             } => {
                 if *required && !*excluded {
-                    // All keywords in this required term must be present
-                    keywords.iter().all(|kw| {
+                    // Use pre-computed lowercase keywords (computed once at parse time)
+                    lowercase_keywords.iter().all(|kw| {
                         term_indices
                             .get(kw)
                             .map(|idx| matched_terms.contains(idx))
@@ -158,7 +160,7 @@ impl Expr {
             return false;
         }
 
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         // CRITICAL FIX: Check required terms FIRST before any other evaluation
         // In Lucene semantics, if ANY required term is missing, the entire query fails
@@ -176,6 +178,7 @@ impl Expr {
         match self {
             Expr::Term {
                 keywords,
+                lowercase_keywords,
                 required,
                 excluded,
                 ..
@@ -184,8 +187,10 @@ impl Expr {
                     // Empty term => if excluded, trivially true, otherwise false
                     return *excluded;
                 }
+
+                // Use pre-computed lowercase keywords (computed once at parse time)
                 // Are all keywords present?
-                let all_present = keywords.iter().all(|kw| {
+                let all_present = lowercase_keywords.iter().all(|kw| {
                     term_indices
                         .get(kw)
                         .map(|idx| matched_terms.contains(idx))
@@ -198,7 +203,7 @@ impl Expr {
                         true
                     } else {
                         // Excluded => none should be present
-                        !keywords.iter().any(|kw| {
+                        !lowercase_keywords.iter().any(|kw| {
                             term_indices
                                 .get(kw)
                                 .map(|idx| matched_terms.contains(idx))
@@ -212,32 +217,20 @@ impl Expr {
                     // Required => must all be present
                     all_present
                 } else {
-                    // Optional => if there's at least one required term anywhere in the entire query,
-                    // then we do NOT fail if this optional is absent. Otherwise, we do need to match.
+                    // Optional term
                     if has_required_anywhere {
+                        // When there are required terms elsewhere, optional terms do not gate inclusion
                         true
                     } else {
-                        // When there are no required terms, we still need to enforce that all keywords
-                        // within a single Term are present (AND logic within a Term).
-                        // This ensures that for a term like "JWTMiddleware" which gets tokenized to
-                        // ["jwt", "middleware"], both parts must be present.
-
-                        // Check if any keywords are present
-                        let any_present = keywords.iter().any(|kw| {
+                        // No required terms: treat multiple keywords within a Term as alternatives
+                        // This avoids false negatives for stemming variants (e.g., repository/repositori).
+                        // Use lowercase_keywords for lookup since term_indices stores lowercase keys.
+                        lowercase_keywords.iter().any(|kw| {
                             term_indices
                                 .get(kw)
                                 .map(|idx| matched_terms.contains(idx))
                                 .unwrap_or(false)
-                        });
-
-                        // If no keywords are present, the term doesn't match
-                        if !any_present {
-                            return false;
-                        }
-
-                        // If at least one keyword is present, require all keywords to be present
-                        // This maintains the AND relationship between keywords in a single Term
-                        all_present
+                        })
                     }
                 }
             }
@@ -335,22 +328,27 @@ impl Expr {
         // Compute cache key from matched terms
         let cache_key = compute_evaluation_key(matched_terms);
 
-        // Check cache
-        if let Ok(mut cache) = plan.evaluation_cache.lock() {
-            if let Some(&cached_result) = cache.peek(&cache_key) {
-                return cached_result;
+        // Check cache - fail safe on poisoning
+        match plan.evaluation_cache.lock() {
+            Ok(mut cache) => {
+                if let Some(&cached_result) = cache.peek(&cache_key) {
+                    return cached_result;
+                }
+
+                // Perform full evaluation
+                let result = self.evaluate(matched_terms, &plan.term_indices, false);
+
+                // Cache the result
+                cache.put(cache_key, result);
+
+                result
             }
-
-            // Perform full evaluation
-            let result = self.evaluate(matched_terms, &plan.term_indices, false);
-
-            // Cache the result
-            cache.put(cache_key, result);
-
-            result
-        } else {
-            // If we can't lock the cache, just evaluate without caching
-            self.evaluate(matched_terms, &plan.term_indices, false)
+            Err(_poisoned) => {
+                // Lock was poisoned - discard cache and evaluate without caching
+                eprintln!("CRITICAL: evaluation_cache lock was poisoned - bypassing cache");
+                // Don't use potentially corrupted cache data - just evaluate
+                self.evaluate(matched_terms, &plan.term_indices, false)
+            }
         }
     }
 
@@ -373,7 +371,7 @@ impl Expr {
             return false;
         }
 
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         // If ignoring negatives, let's ensure that all required terms are present up front.
         // (We skip enforcing them again for each subtree.)
@@ -408,11 +406,16 @@ impl Expr {
             if debug_mode && !required_terms.is_empty() {
                 println!("DEBUG: Required terms (ignoring negatives): {required_terms:?}");
             }
-            for term in &required_terms {
-                if let Some(&idx) = term_indices.get(term) {
+            // Pre-compute lowercase required terms to avoid repeated allocations
+            let lowercase_required: Vec<String> =
+                required_terms.iter().map(|t| t.to_lowercase()).collect();
+            for (original_term, lowercase_term) in
+                required_terms.iter().zip(lowercase_required.iter())
+            {
+                if let Some(&idx) = term_indices.get(lowercase_term) {
                     if !matched_terms.contains(&idx) {
                         if debug_mode {
-                            println!("DEBUG: Missing required term '{term}' (idx={idx})");
+                            println!("DEBUG: Missing required term '{original_term}' (idx={idx})");
                         }
                         return false;
                     }
@@ -452,6 +455,7 @@ impl std::fmt::Display for Expr {
                 required,
                 excluded,
                 exact,
+                ..
             } => {
                 let prefix = if *required {
                     "+"
@@ -516,11 +520,29 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Helper function to create a Term with pre-computed lowercase keywords
+fn make_term(
+    keywords: Vec<String>,
+    field: Option<String>,
+    required: bool,
+    excluded: bool,
+    exact: bool,
+) -> Expr {
+    Expr::Term {
+        lowercase_keywords: keywords.iter().map(|k| k.to_lowercase()).collect(),
+        keywords,
+        field,
+        required,
+        excluded,
+        exact,
+    }
+}
+
 /// Tokenize input string into a vector of tokens
 fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut chars = input.chars().peekable();
     let mut tokens = Vec::new();
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     while let Some(&ch) = chars.peek() {
         match ch {
@@ -659,7 +681,7 @@ impl Parser {
     }
 
     fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
         if debug_mode {
             println!("DEBUG: parse_or_expr => pos={pos}", pos = self.pos);
         }
@@ -678,7 +700,7 @@ impl Parser {
     }
 
     fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
         if debug_mode {
             println!("DEBUG: parse_and_expr => pos={pos}", pos = self.pos);
         }
@@ -740,7 +762,7 @@ impl Parser {
     fn parse_prefixed_term(&mut self) -> Result<Expr, ParseError> {
         let mut required = false;
         let mut excluded = false;
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         match self.peek() {
             Some(Token::Plus) => {
@@ -762,6 +784,7 @@ impl Parser {
             required: _,
             excluded: _,
             exact,
+            ..
         } = primary_expr
         {
             // If exact or excluded => skip further tokenization
@@ -788,13 +811,7 @@ impl Parser {
                 println!("DEBUG: parse_prefixed_term => required={required}, excluded={excluded}, final_keywords={final_keywords:?}");
             }
 
-            Ok(Expr::Term {
-                keywords: final_keywords,
-                field,
-                required,
-                excluded,
-                exact,
-            })
+            Ok(make_term(final_keywords, field, required, excluded, exact))
         } else {
             // If it's a sub-expression in parentheses or something else, just return it
             Ok(primary_expr)
@@ -802,7 +819,7 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         match self.peek() {
             // Quoted => exact
@@ -812,13 +829,7 @@ impl Parser {
                 if debug_mode {
                     println!("DEBUG: QuotedString => {val}");
                 }
-                Ok(Expr::Term {
-                    keywords: vec![val],
-                    field: None,
-                    required: false,
-                    excluded: false,
-                    exact: true,
-                })
+                Ok(make_term(vec![val], None, false, false, true))
             }
             // Possibly field:term
             Some(Token::Ident(_)) => {
@@ -829,50 +840,49 @@ impl Parser {
                     println!("DEBUG: Ident => {first}");
                 }
                 if let Some(Token::Colon) = self.peek() {
-                    // We have "field:"
                     self.next(); // consume colon
-                                 // Next could be ident or quoted
-                    match self.peek() {
-                        Some(Token::Ident(ident2)) => {
-                            let val2 = ident2.clone();
-                            self.next();
-                            Ok(Expr::Term {
-                                keywords: vec![val2],
-                                field: Some(first),
-                                required: false,
-                                excluded: false,
-                                exact: false,
-                            })
+
+                    if let Some(Token::Colon) = self.peek() {
+                        self.next(); // consume the second colon in a namespace separator
+                        let Some(Token::Ident(next_ident)) = self.next() else {
+                            return Ok(make_term(vec![first], None, false, false, false));
+                        };
+
+                        let mut qualified = format!("{first}::{next_ident}");
+                        while matches!(self.peek(), Some(Token::Colon))
+                            && matches!(self.tokens.get(self.pos + 1), Some(Token::Colon))
+                        {
+                            self.next(); // consume first colon
+                            self.next(); // consume second colon
+                            let Some(Token::Ident(part)) = self.next() else {
+                                break;
+                            };
+                            qualified.push_str("::");
+                            qualified.push_str(&part);
                         }
-                        Some(Token::QuotedString(qs)) => {
-                            let qval = qs.clone();
-                            self.next();
-                            Ok(Expr::Term {
-                                keywords: vec![qval],
-                                field: Some(first),
-                                required: false,
-                                excluded: false,
-                                exact: true,
-                            })
+
+                        Ok(make_term(vec![qualified], None, false, false, false))
+                    } else {
+                        // We have "field:".
+                        // Next could be ident or quoted.
+                        match self.peek() {
+                            Some(Token::Ident(ident2)) => {
+                                let val2 = ident2.clone();
+                                self.next();
+                                Ok(make_term(vec![val2], Some(first), false, false, false))
+                            }
+                            Some(Token::QuotedString(qs)) => {
+                                let qval = qs.clone();
+                                self.next();
+                                Ok(make_term(vec![qval], Some(first), false, false, true))
+                            }
+                            // If nothing or other token => empty term
+                            _ => Ok(make_term(vec![], Some(first), false, false, false)),
                         }
-                        // If nothing or other token => empty term
-                        _ => Ok(Expr::Term {
-                            keywords: vec![],
-                            field: Some(first),
-                            required: false,
-                            excluded: false,
-                            exact: false,
-                        }),
                     }
                 } else {
                     // Just a plain ident
-                    Ok(Expr::Term {
-                        keywords: vec![first],
-                        field: None,
-                        required: false,
-                        excluded: false,
-                        exact: false,
-                    })
+                    Ok(make_term(vec![first], None, false, false, false))
                 }
             }
             Some(t) => Err(ParseError::UnexpectedToken(t.clone())),
@@ -883,7 +893,7 @@ impl Parser {
 
 /// Parse the query string into an AST
 pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     if debug_mode {
         println!("DEBUG: parse_query('{input}', exact={exact})");
@@ -894,13 +904,7 @@ pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
         if debug_mode {
             println!("DEBUG: Exact search enabled, treating query as a single term");
         }
-        return Ok(Expr::Term {
-            keywords: vec![input.to_string()],
-            field: None,
-            required: false,
-            excluded: false,
-            exact: true,
-        });
+        return Ok(make_term(vec![input.to_string()], None, false, false, true));
     }
 
     // Tokenize
@@ -924,13 +928,7 @@ pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
                 .split_whitespace()
                 .map(|s| s.to_lowercase())
                 .collect::<Vec<String>>();
-            return Ok(Expr::Term {
-                keywords,
-                field: None,
-                required: false,
-                excluded: false,
-                exact: false,
-            });
+            return Ok(make_term(keywords, None, false, false, false));
         }
     };
 
@@ -953,13 +951,7 @@ pub fn parse_query(input: &str, exact: bool) -> Result<Expr, ParseError> {
                 "No valid identifiers found".to_string(),
             ));
         }
-        return Ok(Expr::Term {
-            keywords: idents,
-            field: None,
-            required: false,
-            excluded: false,
-            exact: false,
-        });
+        return Ok(make_term(idents, None, false, false, false));
     }
 
     // Otherwise success

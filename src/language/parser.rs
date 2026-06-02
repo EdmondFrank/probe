@@ -325,12 +325,12 @@ fn find_acceptable_child<'a>(node: Node<'a>, language_impl: &dyn LanguageImpl) -
 
 /// Finds the immediate next node that follows a given node in the AST
 fn find_immediate_next_node(node: Node<'_>) -> Option<Node<'_>> {
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
     // First try direct next sibling
     if let Some(next) = node.next_sibling() {
         if debug_mode {
-            println!(
+            eprintln!(
                 "DEBUG: Found immediate next sibling: type='{}', lines={}-{}",
                 next.kind(),
                 next.start_position().row + 1,
@@ -344,7 +344,7 @@ fn find_immediate_next_node(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(parent) = node.parent() {
         if let Some(next_parent) = parent.next_sibling() {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found parent's next sibling: type='{}', lines={}-{}",
                     next_parent.kind(),
                     next_parent.start_position().row + 1,
@@ -356,7 +356,7 @@ fn find_immediate_next_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 
     if debug_mode {
-        println!("DEBUG: No immediate next node found");
+        eprintln!("DEBUG: No immediate next node found");
     }
     None
 }
@@ -371,7 +371,7 @@ fn find_comment_context_node<'a>(
     let start_row = comment_node.start_position().row;
 
     if debug_mode {
-        println!(
+        eprintln!(
             "DEBUG: Finding context for comment at lines {}-{}: {}",
             comment_node.start_position().row + 1,
             comment_node.end_position().row + 1,
@@ -398,7 +398,7 @@ fn find_comment_context_node<'a>(
         // Found a non-comment sibling
         if language_impl.is_acceptable_parent(&sibling) {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found next non-comment sibling for comment at line {}: type='{}', lines={}-{}",
                     start_row + 1,
                     sibling.kind(),
@@ -411,7 +411,7 @@ fn find_comment_context_node<'a>(
             // If next sibling isn't acceptable, check its children
             if let Some(child) = find_acceptable_child(sibling, language_impl) {
                 if debug_mode {
-                    println!(
+                    eprintln!(
                         "DEBUG: Found acceptable child in next non-comment sibling for comment at line {}: type='{}', lines={}-{}",
                         start_row + 1,
                         child.kind(),
@@ -436,7 +436,7 @@ fn find_comment_context_node<'a>(
         if let Some(prev_sibling) = find_prev_sibling(comment_node) {
             if language_impl.is_acceptable_parent(&prev_sibling) {
                 if debug_mode {
-                    println!(
+                    eprintln!(
                         "DEBUG: Found previous sibling for comment at line {}: type='{}', lines={}-{}",
                         start_row + 1,
                         prev_sibling.kind(),
@@ -449,7 +449,7 @@ fn find_comment_context_node<'a>(
                 // If previous sibling isn't acceptable, check its children
                 if let Some(child) = find_acceptable_child(prev_sibling, language_impl) {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Found acceptable child in previous sibling for comment at line {}: type='{}', lines={}-{}",
                             start_row + 1,
                             child.kind(),
@@ -468,7 +468,7 @@ fn find_comment_context_node<'a>(
     while let Some(parent) = current.parent() {
         if language_impl.is_acceptable_parent(&parent) {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found parent for comment at line {}: type='{}', lines={}-{}",
                     start_row + 1,
                     parent.kind(),
@@ -485,7 +485,7 @@ fn find_comment_context_node<'a>(
     if let Some(next_node) = find_immediate_next_node(comment_node) {
         if language_impl.is_acceptable_parent(&next_node) {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Using immediate next acceptable node: type='{}', lines={}-{}",
                     next_node.kind(),
                     next_node.start_position().row + 1,
@@ -498,7 +498,7 @@ fn find_comment_context_node<'a>(
         // Look for acceptable child in the next node
         if let Some(child) = find_acceptable_child(next_node, language_impl) {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found acceptable child in next node: type='{}', lines={}-{}",
                     child.kind(),
                     child.start_position().row + 1,
@@ -510,7 +510,7 @@ fn find_comment_context_node<'a>(
     }
 
     if debug_mode {
-        println!("DEBUG: No related node found for the comment");
+        eprintln!("DEBUG: No related node found for the comment");
     }
     None
 }
@@ -535,7 +535,7 @@ fn build_sparse_line_map<'a>(
     sorted_lines.sort();
 
     if debug_mode {
-        println!(
+        eprintln!(
             "DEBUG: SPARSE OPTIMIZATION - Building sparse line map for {} lines",
             sorted_lines.len()
         );
@@ -565,7 +565,7 @@ fn build_sparse_line_map<'a>(
     let mut sparse_map = SparseLineMap::new(base_offset);
 
     if debug_mode {
-        println!(
+        eprintln!(
             "DEBUG: SPARSE OPTIMIZATION - Target ranges: {target_ranges:?}, base_offset: {base_offset}"
         );
     }
@@ -588,7 +588,7 @@ fn build_sparse_line_map<'a>(
     }
 
     if debug_mode {
-        println!("DEBUG: SPARSE OPTIMIZATION - Built sparse line map with {} mappings (vs full file approach)", sparse_map.len());
+        eprintln!("DEBUG: SPARSE OPTIMIZATION - Built sparse line map with {} mappings (vs full file approach)", sparse_map.len());
     }
 
     sparse_map
@@ -620,7 +620,7 @@ fn process_node_sparse<'a>(
 
     if !intersects_target {
         if debug_mode {
-            println!(
+            eprintln!(
                 "DEBUG: SPARSE - Skipping node '{}' at lines {}-{} (no intersection)",
                 node.kind(),
                 start_row + 1,
@@ -700,7 +700,7 @@ fn process_node_sparse<'a>(
                 sparse_map.insert(line, cached_info);
 
                 if debug_mode {
-                    println!(
+                    eprintln!(
                         "DEBUG: SPARSE - Stored mapping for line {}: type='{}', is_comment={}, context={:?}",
                         line + 1,
                         node.kind(),
@@ -770,7 +770,7 @@ fn process_node<'a>(
 
     if !intersects_target {
         if debug_mode {
-            println!(
+            eprintln!(
                 "DEBUG: AST Node filtering - skipping node '{}' at lines {}-{} (no intersection with target ranges)",
                 node.kind(),
                 start_row + 1,
@@ -914,12 +914,12 @@ fn process_sparse_line_map(
         let line_idx = line.saturating_sub(1); // Adjust for 0-based indexing
 
         if debug_mode {
-            println!("DEBUG: Processing line {line} from sparse cache");
+            eprintln!("DEBUG: Processing line {line} from sparse cache");
         }
 
         if let Some(info) = sparse_line_map.get(line_idx) {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found sparse cached node info for line {}: original_type='{}', original_lines={}-{}, is_comment={}, is_test={}, context_kind={:?}, context_lines={:?}, context_is_test={:?}",
                     line,
                     info.node_kind,
@@ -943,7 +943,7 @@ fn process_sparse_line_map(
             // Handle Comments
             if info.is_comment {
                 if debug_mode {
-                    println!("DEBUG: Sparse Cache: Handling comment node at line {line}");
+                    eprintln!("DEBUG: Sparse Cache: Handling comment node at line {line}");
                 }
                 // Check for context node
                 if let (Some(ctx_rows), Some(ctx_bytes), Some(ctx_kind), Some(ctx_is_test)) = (
@@ -958,7 +958,7 @@ fn process_sparse_line_map(
 
                     if !should_use_context {
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Sparse Cache: Skipping test context node at lines {}-{}, type: {}",
                                 ctx_rows.0 + 1,
                                 ctx_rows.1 + 1,
@@ -983,9 +983,10 @@ fn process_sparse_line_map(
                                 parent_node_type: None,
                                 parent_start_row: None,
                                 parent_end_row: None,
+                                parent_context: None,
                             });
                             if debug_mode {
-                                println!(
+                                eprintln!(
                                     "DEBUG: Sparse Cache: Potential merged block (comment + context) at lines {}-{}, type: {}",
                                     merged_start_row + 1, merged_end_row + 1, ctx_kind
                                 );
@@ -1009,7 +1010,7 @@ fn process_sparse_line_map(
 
                                 if should_filter {
                                     if debug_mode {
-                                        println!(
+                                        eprintln!(
                                             "DEBUG: Sparse Cache: Filtering out complete test function block at lines {}-{}, type: {}",
                                             block.start_row + 1, block.end_row + 1, block.node_type
                                         );
@@ -1037,9 +1038,10 @@ fn process_sparse_line_map(
                             parent_node_type: None,
                             parent_start_row: None,
                             parent_end_row: None,
+                            parent_context: None,
                         });
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Sparse Cache: Potential individual comment block at lines {}-{}",
                                 info.start_row + 1,
                                 info.end_row + 1
@@ -1053,7 +1055,7 @@ fn process_sparse_line_map(
                 // Skip original test nodes if not allowed
                 if !allow_tests && info.is_test {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Sparse Cache: Skipping original test node at lines {}-{}",
                             info.start_row + 1,
                             info.end_row + 1
@@ -1071,7 +1073,7 @@ fn process_sparse_line_map(
                 ) {
                     if !allow_tests && ctx_is_test {
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Sparse Cache: Skipping test context node (ancestor) at lines {}-{}",
                                 ctx_rows.0 + 1, ctx_rows.1 + 1
                             );
@@ -1089,9 +1091,10 @@ fn process_sparse_line_map(
                                 parent_node_type: info.parent_node_type.clone(),
                                 parent_start_row: info.parent_start_row,
                                 parent_end_row: info.parent_end_row,
+                                parent_context: None,
                             });
                             if debug_mode {
-                                println!(
+                                eprintln!(
                                     "DEBUG: Sparse Cache: Potential context node (ancestor) block at lines {}-{}",
                                     ctx_rows.0 + 1, ctx_rows.1 + 1
                                 );
@@ -1122,9 +1125,10 @@ fn process_sparse_line_map(
                             parent_node_type: info.parent_node_type.clone(),
                             parent_start_row: info.parent_start_row,
                             parent_end_row: info.parent_end_row,
+                            parent_context: None,
                         });
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Sparse Cache: Potential acceptable original node block at lines {}-{}",
                                 info.start_row + 1, info.end_row + 1
                             );
@@ -1138,7 +1142,7 @@ fn process_sparse_line_map(
                 if !seen_block_spans.contains(&key) {
                     seen_block_spans.insert(key);
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Sparse Cache: Added new block at lines {}-{}, type: {}",
                             key.0 + 1,
                             key.1 + 1,
@@ -1149,7 +1153,7 @@ fn process_sparse_line_map(
                 }
             }
         } else if debug_mode {
-            println!("DEBUG: Sparse Cache: No cached node info found for line {line}");
+            eprintln!("DEBUG: Sparse Cache: No cached node info found for line {line}");
         }
     }
 
@@ -1303,19 +1307,19 @@ fn process_cached_line_map(
         let line_idx = line.saturating_sub(1); // Adjust for 0-based indexing
 
         if debug_mode {
-            println!("DEBUG: Processing line {line} from cache");
+            eprintln!("DEBUG: Processing line {line} from cache");
         }
 
         if line_idx >= cached_line_map.len() {
             if debug_mode {
-                println!("DEBUG: Line {line} is out of bounds (Cache)");
+                eprintln!("DEBUG: Line {line} is out of bounds (Cache)");
             }
             continue;
         }
 
         if let Some(info) = &cached_line_map[line_idx] {
             if debug_mode {
-                println!(
+                eprintln!(
                     "DEBUG: Found cached node info for line {}: original_type='{}', original_lines={}-{}, is_comment={}, is_test={}, context_kind={:?}, context_lines={:?}",
                     line,
                     info.node_kind,
@@ -1337,7 +1341,7 @@ fn process_cached_line_map(
             // 1. Handle Comments
             if info.is_comment {
                 if debug_mode {
-                    println!("DEBUG: Cache: Handling comment node at line {line}");
+                    eprintln!("DEBUG: Cache: Handling comment node at line {line}");
                 }
                 // Check for context node
                 if let (Some(ctx_rows), Some(ctx_bytes), Some(ctx_kind), Some(ctx_is_test)) = (
@@ -1349,7 +1353,7 @@ fn process_cached_line_map(
                     // Check test status of the context node
                     if !allow_tests && ctx_is_test {
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Cache: Skipping test context node at lines {}-{}, type: {}",
                                 ctx_rows.0 + 1,
                                 ctx_rows.1 + 1,
@@ -1375,9 +1379,10 @@ fn process_cached_line_map(
                                 parent_node_type: None, // Consistent with original miss path logic
                                 parent_start_row: None,
                                 parent_end_row: None,
+                                parent_context: None,
                             });
                             if debug_mode {
-                                println!(
+                                eprintln!(
                                     "DEBUG: Cache: Potential merged block (comment + context) at lines {}-{}, type: {}",
                                     merged_start_row + 1, merged_end_row + 1, ctx_kind
                                 );
@@ -1389,7 +1394,7 @@ fn process_cached_line_map(
                             || potential_block.is_some()
                         {
                             if seen_block_spans.contains(&block_key.unwrap()) && debug_mode {
-                                println!(
+                                eprintln!(
                                     "DEBUG: Cache: Merged block span {}-{} already seen",
                                     block_key.unwrap().0 + 1,
                                     block_key.unwrap().1 + 1
@@ -1420,16 +1425,17 @@ fn process_cached_line_map(
                             parent_node_type: None,
                             parent_start_row: None,
                             parent_end_row: None,
+                            parent_context: None,
                         });
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Cache: Potential individual comment block at lines {}-{}",
                                 info.start_row + 1,
                                 info.end_row + 1
                             );
                         }
                     } else if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache: Individual comment span {}-{} already seen",
                             block_key.unwrap().0 + 1,
                             block_key.unwrap().1 + 1
@@ -1442,7 +1448,7 @@ fn process_cached_line_map(
                 // Skip original test nodes if not allowed
                 if !allow_tests && info.is_test {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache: Skipping original test node at lines {}-{}",
                             info.start_row + 1,
                             info.end_row + 1
@@ -1461,7 +1467,7 @@ fn process_cached_line_map(
                     // Check test status of the context node
                     if !allow_tests && ctx_is_test {
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Cache: Skipping test context node (ancestor) at lines {}-{}",
                                 ctx_rows.0 + 1, ctx_rows.1 + 1
                             );
@@ -1481,15 +1487,16 @@ fn process_cached_line_map(
                                 parent_node_type: info.parent_node_type.clone(),
                                 parent_start_row: info.parent_start_row,
                                 parent_end_row: info.parent_end_row,
+                                parent_context: None,
                             });
                             if debug_mode {
-                                println!(
+                                eprintln!(
                                     "DEBUG: Cache: Potential context node (ancestor) block at lines {}-{}",
                                     ctx_rows.0 + 1, ctx_rows.1 + 1
                                 );
                             }
                         } else if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Cache: Context node span {}-{} already seen",
                                 block_key.unwrap().0 + 1,
                                 block_key.unwrap().1 + 1
@@ -1523,15 +1530,16 @@ fn process_cached_line_map(
                             parent_node_type: info.parent_node_type.clone(),
                             parent_start_row: info.parent_start_row,
                             parent_end_row: info.parent_end_row,
+                            parent_context: None,
                         });
                         if debug_mode {
-                            println!(
+                            eprintln!(
                                 "DEBUG: Cache: Potential acceptable original node block at lines {}-{}",
                                 info.start_row + 1, info.end_row + 1
                             );
                         }
                     } else if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache: Original acceptable node span {}-{} already seen",
                             block_key.unwrap().0 + 1,
                             block_key.unwrap().1 + 1
@@ -1561,7 +1569,7 @@ fn process_cached_line_map(
                             (Some(cur_pri), Some(exist_pri)) if cur_pri > exist_pri => {
                                 // Replace with higher priority node
                                 if debug_mode {
-                                    println!(
+                                    eprintln!(
                                         "DEBUG: Cache: Replaced block at lines {}-{} with higher priority type: {} > {}",
                                         key.0 + 1, key.1 + 1, block.node_type, existing_node_type
                                     );
@@ -1571,7 +1579,7 @@ fn process_cached_line_map(
                             _ => {
                                 // Keep existing (higher or equal priority)
                                 if debug_mode {
-                                    println!(
+                                    eprintln!(
                                         "DEBUG: Cache: Keeping existing block at lines {}-{} with priority: {} >= {}",
                                         key.0 + 1, key.1 + 1,
                                         existing_node_type, block.node_type
@@ -1584,7 +1592,7 @@ fn process_cached_line_map(
                     // New span - add it
                     seen_block_spans.insert(key);
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache: Added new block at lines {}-{}, type: {}",
                             key.0 + 1,
                             key.1 + 1,
@@ -1595,7 +1603,7 @@ fn process_cached_line_map(
                 }
             }
         } else if debug_mode {
-            println!("DEBUG: Cache: No cached node info found for line {line}");
+            eprintln!("DEBUG: Cache: No cached node info found for line {line}");
         }
     }
 
@@ -1653,7 +1661,7 @@ fn process_cached_line_map(
                 // Case 1: Current block is contained within previous block
                 if block.start_row >= prev_block.start_row && block.end_row <= prev_block.end_row {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache Dedupe: Current block contained: type='{}', lines={}-{} (in type='{}', lines={}-{})",
                             block.node_type, block.start_row + 1, block.end_row + 1,
                             prev_block.node_type, prev_block.start_row + 1, prev_block.end_row + 1
@@ -1661,12 +1669,14 @@ fn process_cached_line_map(
                     }
                     if is_important && !prev_is_important {
                         if debug_mode {
-                            println!("DEBUG: Cache Dedupe: Keeping important contained block");
+                            eprintln!("DEBUG: Cache Dedupe: Keeping important contained block");
                         }
                         // Keep both - don't remove, don't skip add
                     } else if !is_important && prev_is_important {
                         if debug_mode {
-                            println!("DEBUG: Cache Dedupe: Skipping non-important contained block");
+                            eprintln!(
+                                "DEBUG: Cache Dedupe: Skipping non-important contained block"
+                            );
                         }
                         should_add = false;
                         break;
@@ -1684,14 +1694,14 @@ fn process_cached_line_map(
                                 if cur_pri > prev_pri {
                                     // Current block has higher priority - keep it, remove previous
                                     if debug_mode {
-                                        println!("DEBUG: Cache Dedupe: Replacing block with higher priority type: {} > {}", 
+                                        eprintln!("DEBUG: Cache Dedupe: Replacing block with higher priority type: {} > {}",
                                                 block.node_type, prev_block.node_type);
                                     }
                                     blocks_to_remove.push(idx);
                                 } else {
                                     // Previous block has higher or equal priority - keep previous, skip current
                                     if debug_mode {
-                                        println!("DEBUG: Cache Dedupe: Skipping block in favor of higher priority type: {} >= {}", 
+                                        eprintln!("DEBUG: Cache Dedupe: Skipping block in favor of higher priority type: {} >= {}",
                                                 prev_block.node_type, block.node_type);
                                     }
                                     should_add = false;
@@ -1701,7 +1711,7 @@ fn process_cached_line_map(
                             _ => {
                                 // Fallback: prefer contained (current) block for consistency
                                 if debug_mode {
-                                    println!("DEBUG: Cache Dedupe: Replacing outer block with contained block (no priority)");
+                                    eprintln!("DEBUG: Cache Dedupe: Replacing outer block with contained block (no priority)");
                                 }
                                 blocks_to_remove.push(idx);
                             }
@@ -1713,7 +1723,7 @@ fn process_cached_line_map(
                     && prev_block.end_row <= block.end_row
                 {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache Dedupe: Previous block contained: type='{}', lines={}-{} (contains type='{}', lines={}-{})",
                             block.node_type, block.start_row + 1, block.end_row + 1,
                             prev_block.node_type, prev_block.start_row + 1, prev_block.end_row + 1
@@ -1721,12 +1731,12 @@ fn process_cached_line_map(
                     }
                     if is_important && !prev_is_important {
                         if debug_mode {
-                            println!("DEBUG: Cache Dedupe: Keeping important outer block");
+                            eprintln!("DEBUG: Cache Dedupe: Keeping important outer block");
                         }
                         // Keep both - don't skip add, continue checking
                     } else if !is_important && prev_is_important {
                         if debug_mode {
-                            println!("DEBUG: Cache Dedupe: Skipping non-important outer block");
+                            eprintln!("DEBUG: Cache Dedupe: Skipping non-important outer block");
                         }
                         should_add = false;
                         break;
@@ -1744,14 +1754,14 @@ fn process_cached_line_map(
                                 if cur_pri > prev_pri {
                                     // Current block has higher priority - keep it, remove previous
                                     if debug_mode {
-                                        println!("DEBUG: Cache Dedupe: Replacing contained block with higher priority type: {} > {}", 
+                                        eprintln!("DEBUG: Cache Dedupe: Replacing contained block with higher priority type: {} > {}",
                                                 block.node_type, prev_block.node_type);
                                     }
                                     blocks_to_remove.push(idx);
                                 } else {
                                     // Previous block has higher or equal priority - keep previous, skip current
                                     if debug_mode {
-                                        println!("DEBUG: Cache Dedupe: Skipping outer block in favor of higher priority contained type: {} >= {}", 
+                                        eprintln!("DEBUG: Cache Dedupe: Skipping outer block in favor of higher priority contained type: {} >= {}",
                                                 prev_block.node_type, block.node_type);
                                     }
                                     should_add = false;
@@ -1761,7 +1771,7 @@ fn process_cached_line_map(
                             _ => {
                                 // Fallback: prefer contained (previous) block for consistency
                                 if debug_mode {
-                                    println!("DEBUG: Cache Dedupe: Skipping outer block (already have contained, no priority)");
+                                    eprintln!("DEBUG: Cache Dedupe: Skipping outer block (already have contained, no priority)");
                                 }
                                 should_add = false;
                                 break;
@@ -1772,7 +1782,7 @@ fn process_cached_line_map(
                 // Case 3: Blocks partially overlap
                 else {
                     if debug_mode {
-                        println!(
+                        eprintln!(
                             "DEBUG: Cache Dedupe: Partial overlap: type='{}', lines={}-{} (overlaps type='{}', lines={}-{})",
                             block.node_type, block.start_row + 1, block.end_row + 1,
                             prev_block.node_type, prev_block.start_row + 1, prev_block.end_row + 1
@@ -1829,19 +1839,20 @@ pub fn parse_file_for_code_blocks_with_tree(
     _term_matches: Option<&HashMap<usize, HashSet<usize>>>, // Query index to line numbers
     pre_parsed_tree: Option<tree_sitter::Tree>,
 ) -> Result<Vec<CodeBlock>> {
+    // Check for debug mode
+    let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
+
     // Get the appropriate language implementation
     let language_impl = match get_language_impl(extension) {
         Some(lang) => lang,
         None => {
-            return Err(anyhow::anyhow!(format!(
-                "Unsupported file type: {}",
-                extension
-            )))
+            // For unsupported languages, return empty blocks to trigger fallback to literal extraction
+            if debug_mode {
+                eprintln!("DEBUG: File extension '{extension}' not supported for AST parsing, returning empty blocks for fallback");
+            }
+            return Ok(Vec::new());
         }
     };
-
-    // Check for debug mode
-    let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
 
     // Calculate content hash for cache key
     let content_hash = calculate_content_hash(content);
@@ -1850,7 +1861,7 @@ pub fn parse_file_for_code_blocks_with_tree(
     // Check if we have a cached sparse line map
     if let Some(cached_entry) = LINE_MAP_CACHE.get(&cache_key) {
         if debug_mode {
-            println!("DEBUG: Sparse cache hit for line_map key: {cache_key}");
+            eprintln!("DEBUG: Sparse cache hit for line_map key: {cache_key}");
         }
 
         // Process the sparse cached line map
@@ -1865,7 +1876,7 @@ pub fn parse_file_for_code_blocks_with_tree(
     }
 
     if debug_mode {
-        println!(
+        eprintln!(
             "DEBUG: Sparse cache miss for line_map key: {cache_key}. Building sparse line map..."
         );
     }
@@ -1873,7 +1884,7 @@ pub fn parse_file_for_code_blocks_with_tree(
     // Get the tree - either use pre-parsed or parse it
     let tree = if let Some(pre_parsed) = pre_parsed_tree {
         if debug_mode {
-            println!("DEBUG: Using pre-parsed tree, skipping redundant parsing");
+            eprintln!("DEBUG: Using pre-parsed tree, skipping redundant parsing");
         }
         pre_parsed
     } else {
@@ -1893,8 +1904,8 @@ pub fn parse_file_for_code_blocks_with_tree(
     let root_node = tree.root_node();
 
     if debug_mode {
-        println!("DEBUG: SPARSE OPTIMIZATION - Parsing file with extension: {extension}");
-        println!(
+        eprintln!("DEBUG: SPARSE OPTIMIZATION - Parsing file with extension: {extension}");
+        eprintln!(
             "DEBUG: SPARSE OPTIMIZATION - Root node type: {}",
             root_node.kind()
         );
@@ -1911,7 +1922,7 @@ pub fn parse_file_for_code_blocks_with_tree(
     );
 
     if debug_mode {
-        println!(
+        eprintln!(
             "DEBUG: SPARSE OPTIMIZATION - Sparse line map built with {} entries",
             sparse_line_map.len()
         );
@@ -1929,8 +1940,83 @@ pub fn parse_file_for_code_blocks_with_tree(
     // Store the sparse line map in cache for future requests
     LINE_MAP_CACHE.insert(cache_key.clone(), sparse_line_map);
     if debug_mode {
-        println!("DEBUG: SPARSE OPTIMIZATION - Stored sparse line map in cache key: {cache_key}");
+        eprintln!("DEBUG: SPARSE OPTIMIZATION - Stored sparse line map in cache key: {cache_key}");
     }
 
     Ok(code_blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_parse_file_unsupported_language_returns_empty() {
+        // Test that parsing an unsupported language returns empty blocks instead of error
+        let content = r#"
+        # Terraform configuration
+        resource "aws_instance" "example" {
+          ami           = "ami-0c55b159cbfafe1f0"
+          instance_type = "t2.micro"
+        }
+        "#;
+
+        let mut line_numbers = HashSet::new();
+        line_numbers.insert(3); // Line with 'resource'
+
+        // .tf extension is not supported by tree-sitter
+        let result = parse_file_for_code_blocks(
+            content,
+            "tf", // Terraform extension, not supported
+            &line_numbers,
+            false, // allow_tests
+            None,  // term_matches
+        );
+
+        // Should return Ok with empty vector, not an error
+        assert!(result.is_ok(), "Should not error for unsupported language");
+        let blocks = result.unwrap();
+        assert_eq!(
+            blocks.len(),
+            0,
+            "Should return empty blocks for unsupported language"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_supported_language_returns_blocks() {
+        // Test that parsing a supported language returns appropriate blocks
+        let content = r#"fn main() {
+    println!("Hello, world!");
+}
+
+fn test_function() {
+    assert_eq!(1, 1);
+}"#;
+
+        let mut line_numbers = HashSet::new();
+        line_numbers.insert(2); // Line inside main function
+
+        let result = parse_file_for_code_blocks(
+            content,
+            "rs", // Rust extension, supported
+            &line_numbers,
+            false, // allow_tests
+            None,  // term_matches
+        );
+
+        assert!(result.is_ok(), "Should succeed for supported language");
+        let blocks = result.unwrap();
+        assert!(
+            !blocks.is_empty(),
+            "Should return code blocks for supported language"
+        );
+
+        // Check that we found a function block
+        let has_function = blocks
+            .iter()
+            .any(|b| b.node_type == "function_item" || b.node_type == "function");
+        assert!(has_function, "Should find a function block");
+    }
 }

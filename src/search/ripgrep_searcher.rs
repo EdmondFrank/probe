@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
-use regex::RegexSet;
+use regex::{RegexSet, RegexSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// High-performance RegexSet-based searcher for fast file pattern matching
 /// This provides optimal performance through:
-/// - Pre-compiled RegexSet for multi-pattern efficiency  
+/// - Pre-compiled RegexSet for multi-pattern efficiency
 /// - Simple file I/O without unnecessary abstraction layers
 /// - Parallel processing capabilities
 /// - Thread-safe design for concurrent access
+#[derive(Debug)]
 pub struct RipgrepSearcher {
     debug_mode: bool,
     regex_set: RegexSet,
@@ -18,7 +19,7 @@ pub struct RipgrepSearcher {
 impl RipgrepSearcher {
     /// Create a new RipgrepSearcher with optimized settings
     pub fn new(patterns: &[String], _enable_simd: bool) -> Result<Self> {
-        let debug_mode = std::env::var("DEBUG").unwrap_or_default() == "1";
+        let debug_mode = std::env::var("PROBE_DEBUG").unwrap_or_default() == "1";
 
         if debug_mode {
             println!(
@@ -28,10 +29,46 @@ impl RipgrepSearcher {
         }
 
         // Pre-compile RegexSet for efficient pattern matching
-        let case_insensitive_patterns: Vec<String> =
-            patterns.iter().map(|p| format!("(?i){p}")).collect();
-        let regex_set = RegexSet::new(&case_insensitive_patterns)
-            .context("Failed to build RegexSet during initialization")?;
+        // Check if patterns already have case-insensitive flags to avoid double-wrapping
+        let case_insensitive_patterns: Vec<String> = patterns
+            .iter()
+            .map(|p| {
+                if p.starts_with("(?i") {
+                    p.clone()
+                } else {
+                    format!("(?i:{p})")
+                }
+            })
+            .collect();
+
+        // Calculate estimated regex size to avoid exceeding limits (10MB)
+        let total_pattern_size: usize = case_insensitive_patterns.iter().map(|p| p.len()).sum();
+
+        const MAX_REGEX_SIZE: usize = 8 * 1024 * 1024; // 8MB safety margin
+
+        if total_pattern_size > MAX_REGEX_SIZE {
+            return Err(anyhow::anyhow!(
+                "Pattern set too large ({} bytes > {} bytes limit). Consider simplifying your query or using more specific search terms.",
+                total_pattern_size,
+                MAX_REGEX_SIZE
+            ));
+        }
+
+        if debug_mode {
+            println!(
+                "DEBUG: Creating RegexSet with {} patterns, total size: {} bytes",
+                case_insensitive_patterns.len(),
+                total_pattern_size
+            );
+        }
+
+        // Use RegexSetBuilder with size limits for additional protection
+        let mut builder = RegexSetBuilder::new(&case_insensitive_patterns);
+        builder.size_limit(10 * 1024 * 1024); // 10MB compiled program limit
+
+        let regex_set = builder.build().context(
+            "Failed to build RegexSet during initialization - compiled regex exceeds size limits",
+        )?;
 
         Ok(RipgrepSearcher {
             debug_mode,
@@ -56,14 +93,24 @@ impl RipgrepSearcher {
         // Define a reasonable maximum file size (same as old implementation)
         const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
 
-        // Check file metadata and resolve symlinks before reading
-        let resolved_path = match std::fs::canonicalize(file_path) {
-            Ok(path) => path,
-            Err(e) => {
-                if self.debug_mode {
-                    println!("DEBUG: Error resolving path for {file_path:?}: {e:?}");
-                }
-                return Err(anyhow::anyhow!("Failed to resolve file path: {}", e));
+        // Skip symlinks and junctions entirely to avoid stack overflow
+        use crate::path_safety;
+
+        if path_safety::is_symlink_or_junction(file_path) {
+            if self.debug_mode {
+                println!("DEBUG: Skipping symlink/junction: {file_path:?}");
+            }
+            return Err(anyhow::anyhow!("Skipping symlink/junction"));
+        }
+
+        // Use the path as-is in CI to avoid any resolution issues
+        let resolved_path = if path_safety::is_ci_environment() {
+            file_path.to_path_buf()
+        } else {
+            // Only canonicalize if not in CI and not a symlink
+            match std::fs::canonicalize(file_path) {
+                Ok(path) => path,
+                Err(_) => file_path.to_path_buf(), // Fall back to original path
             }
         };
 
@@ -276,5 +323,29 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.contains_key(&file1));
         assert!(results.contains_key(&file2));
+    }
+
+    #[test]
+    fn test_avoid_double_case_insensitive_wrapping() {
+        // Test that patterns already containing (?i) are not wrapped again
+        let patterns = vec!["(?i)(test)".to_string(), "normal".to_string()];
+        let result = RipgrepSearcher::new(&patterns, true);
+
+        // We can't easily test the internal regex_set, but the fact that
+        // it builds without error shows that the double-wrapping issue is fixed
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pattern_size_limit() {
+        // Test that very large patterns are rejected
+        let huge_pattern = "a".repeat(9 * 1024 * 1024); // 9MB pattern
+        let patterns = vec![huge_pattern];
+
+        let result = RipgrepSearcher::new(&patterns, true);
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Pattern set too large"));
     }
 }

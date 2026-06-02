@@ -7,10 +7,12 @@ import path from 'path';
 import fs from 'fs-extra';
 import { fileURLToPath } from 'url';
 import { downloadProbeBinary } from './downloader.js';
+import { getPackageBinDir } from './directory-resolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const binDir = path.resolve(__dirname, '..', 'bin');
+
+// Note: binDir is now resolved dynamically using getPackageBinDir()
 
 // Store the binary path
 let probeBinaryPath = '';
@@ -23,23 +25,37 @@ let probeBinaryPath = '';
  * @returns {Promise<string>} - Path to the binary
  */
 export async function getBinaryPath(options = {}) {
-	const { forceDownload = false, version } = options;
+    const { forceDownload = false, version } = options;
 
-	// Return cached path if available and not forcing download
-	if (probeBinaryPath && !forceDownload && fs.existsSync(probeBinaryPath)) {
-		return probeBinaryPath;
-	}
-
-	// Check environment variable
+    // Check environment variable first (user override)
 	if (process.env.PROBE_PATH && fs.existsSync(process.env.PROBE_PATH) && !forceDownload) {
 		probeBinaryPath = process.env.PROBE_PATH;
 		return probeBinaryPath;
 	}
 
-	// Check bin directory
-	const isWindows = process.platform === 'win32';
-	const binaryName = isWindows ? 'probe.exe' : 'probe';
-	const binaryPath = path.join(binDir, binaryName);
+	// If specific version is requested, download it (don't use cached/postinstall binary)
+	if (version && !forceDownload) {
+		console.log(`Specific version ${version} requested. Downloading...`);
+		probeBinaryPath = await downloadProbeBinary(version);
+		return probeBinaryPath;
+	}
+
+    // Prefer local package bin if available (avoids network during tests/monorepo)
+    const isWindows = process.platform === 'win32';
+    const binaryName = isWindows ? 'probe.exe' : 'probe-binary';
+    const localPackageBin = path.resolve(__dirname, '..', 'bin');
+    const localBinaryPath = path.join(localPackageBin, binaryName);
+    if (fs.existsSync(localBinaryPath) && !forceDownload) {
+        // Use committed binary bundled with the repo/package
+        probeBinaryPath = localBinaryPath;
+        return probeBinaryPath;
+    }
+
+    // Get dynamic bin directory (handles CI, npx, Docker scenarios)
+    const binDir = await getPackageBinDir();
+
+    // Check postinstall binary in resolved directory
+    const binaryPath = path.join(binDir, binaryName);
 
 	if (fs.existsSync(binaryPath) && !forceDownload) {
 		probeBinaryPath = binaryPath;
@@ -70,6 +86,9 @@ export function setBinaryPath(binaryPath) {
  * @returns {Promise<void>}
  */
 export async function ensureBinDirectory() {
+	// This function is now handled by getPackageBinDir() which ensures directory exists
+	// Keeping for backward compatibility but it's no longer needed
+	const binDir = await getPackageBinDir();
 	await fs.ensureDir(binDir);
 }
 
